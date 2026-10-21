@@ -1,0 +1,394 @@
+from __future__ import annotations
+
+from datetime import date
+from typing import Any
+
+from app.chart_system import (
+    ChartEngine,
+    get_capabilities,
+    get_chart_type,
+    get_chart_types,
+    get_engine,
+    get_full,
+)
+from app.chart_system.base import SortSpec, apply_multi_level_sort
+
+
+SCHEMA: dict[str, str] = {
+    "id": "int",
+    "status": "str",
+    "orders_count": "int",
+    "revenue": "float",
+    "created_at": "date",
+    "active": "bool",
+}
+
+
+def test_all_charts_roundtrip_and_valid_types() -> bool:
+    engine = ChartEngine()
+    payloads: list[dict[str, Any]] = [
+        {
+            "type": "bar",
+            "title": "Заказы по статусам",
+            "x": {"name": "status", "description": "статус"},
+            "y": {"name": "orders_count", "description": "количество"},
+            "sort": [{"by": "y", "dir": "desc"}, {"by": "x", "dir": "asc"}],
+            "limit": 50,
+        },
+        {
+            "type": "bar",
+            "title": "Заказы по активности (bool по оси X, без sort/limit)",
+            "x": {"name": "active", "description": "флаг активности"},
+            "y": {"name": "revenue", "description": "выручка"},
+        },
+        {
+            "type": "line",
+            "title": "Динамика по датам",
+            "x": {"name": "created_at", "description": "дата"},
+            "y": {"name": "revenue", "description": "выручка"},
+            "limit": 1000,
+        },
+        {
+            "type": "line",
+            "title": "Динамика по числовой оси X",
+            "x": {"name": "id", "description": "номер шага"},
+            "y": {"name": "orders_count", "description": "заказы"},
+        },
+        {
+            "type": "scatter",
+            "title": "Связь заказов и выручки",
+            "x": {"name": "orders_count", "description": "заказы"},
+            "y": {"name": "revenue", "description": "выручка"},
+            "limit": 500,
+        },
+        {
+            "type": "card",
+            "title": "Общая выручка",
+            "value": {"name": "revenue", "description": "итого"},
+        },
+        {
+            "type": "table",
+            "title": "Полная выгрузка",
+            "columns": [
+                {"name": "id", "description": "ID"},
+                {"name": "status", "description": "Статус"},
+                {"name": "revenue", "description": "Выручка"},
+                {"name": "created_at", "description": "Дата"},
+                {"name": "active", "description": "Активен"},
+            ],
+            "sort": [{"by": "revenue", "dir": "desc"}, {"by": "id", "dir": "asc"}],
+            "limit": 100,
+        },
+    ]
+
+    for raw in payloads:
+        spec = engine.from_dict(raw)
+        if engine.to_dict(spec) != raw:
+            return False
+        val = engine.validate(spec, SCHEMA, row_count=40)
+        if not val.ok or val.errors or val.output_schema is not None:
+            return False
+
+    return True
+
+
+def test_multi_level_sort_stability_dates_and_nulls() -> bool:
+    rows: list[dict[str, Any]] = [
+        {"group": "B", "score": 10, "dt": "2026-01-05"},
+        {"group": "A", "score": None, "dt": "2026-01-01"},
+        {"group": "A", "score": 20, "dt": date(2026, 1, 3)},
+        {"group": "A", "score": 20, "dt": "2026-01-02"},
+        {"group": "B", "score": 20, "dt": "2026-01-01"},
+    ]
+
+    sort_specs = (
+        SortSpec(by="score", dir="desc"),
+        SortSpec(by="group", dir="asc"),
+        SortSpec(by="dt", dir="asc"),
+    )
+    sorted_rows = apply_multi_level_sort(rows, sort_specs)
+
+    expected = [
+        {"group": "A", "score": 20, "dt": "2026-01-02"},
+        {"group": "A", "score": 20, "dt": date(2026, 1, 3)},
+        {"group": "B", "score": 20, "dt": "2026-01-01"},
+        {"group": "B", "score": 10, "dt": "2026-01-05"},
+        {"group": "A", "score": None, "dt": "2026-01-01"},
+    ]
+    if sorted_rows != expected:
+        return False
+
+    mapped_specs = (
+        SortSpec(by="y", dir="asc"),
+        SortSpec(by="x", dir="desc"),
+    )
+    mapped_sorted = apply_multi_level_sort(
+        rows,
+        mapped_specs,
+        key_mapping={"x": "group", "y": "score"},
+    )
+    return (
+        mapped_sorted[0]["score"] == 10
+        and mapped_sorted[1]["group"] == "B"
+        and mapped_sorted[-1]["score"] is None
+    )
+
+
+def test_catalog_completeness_and_prompt_formats() -> bool:
+    eng = get_engine()
+    caps = get_capabilities()
+    chart_types = get_chart_types()
+
+    if not eng.description or len(eng.rules) < 5:
+        return False
+    if not caps.allowed or not caps.unsupported:
+        return False
+
+    expected_names = ["bar", "line", "scatter", "card", "table"]
+    if [c.name for c in chart_types] != expected_names:
+        return False
+
+    for name in expected_names:
+        spec = get_chart_type(name)
+        if spec is None or spec.name != name or not spec.fields or not spec.when_to_use:
+            return False
+
+    if get_chart_type("pie") is not None:
+        return False
+
+    doc_pseudo = get_full(json_syntax=False)
+    doc_json = get_full(json_syntax=True)
+
+    return (
+        "bar: x=status, y=orders_count, sort=y desc, limit=50" in doc_pseudo
+        and "card: value=total_revenue" in doc_pseudo
+        and "```json" in doc_json
+        and '"type": "scatter"' in doc_json
+    )
+
+
+def test_bar_validation_boundaries_and_cardinality() -> bool:
+    engine = ChartEngine()
+    base_bar: dict[str, Any] = {
+        "type": "bar",
+        "title": "Тест границ bar",
+        "x": {"name": "status", "description": ""},
+        "y": {"name": "orders_count", "description": ""},
+        "limit": 200,
+    }
+
+    if not engine.validate(engine.from_dict(base_bar), SCHEMA, row_count=200).ok:
+        return False
+
+    card_fail = engine.validate(engine.from_dict(base_bar), SCHEMA, row_count=201)
+    if card_fail.ok or not any(
+        e.reason == "too_many_categories" and e.value == "201" and e.valid_options == ["200"]
+        for e in card_fail.errors
+    ):
+        return False
+
+    bad_bar = engine.from_dict(
+        {
+            "type": "bar",
+            "title": "Ошибки параметров bar",
+            "x": {"name": "created_at", "description": "date запрещён"},
+            "y": {"name": "status", "description": "str запрещён"},
+            "sort": [
+                {"by": "status", "dir": "asc"},
+                {"by": "y", "dir": "sideways"},
+            ],
+            "limit": 201,
+        }
+    )
+    val = engine.validate(bad_bar, SCHEMA)
+    if val.ok:
+        return False
+
+    err_set = {(e.field, e.reason) for e in val.errors}
+    expected = {
+        ("x.name", "type_mismatch"),
+        ("y.name", "type_mismatch"),
+        ("sort[0].by", "invalid_parameter"),
+        ("sort[1].dir", "invalid_parameter"),
+        ("limit", "invalid_parameter"),
+    }
+    return expected.issubset(err_set)
+
+
+def test_line_scatter_card_specific_constraints() -> bool:
+    engine = ChartEngine()
+
+    bad_line = engine.from_dict(
+        {
+            "type": "line",
+            "title": "Невалидный line",
+            "x": {"name": "status", "description": "str запрещён для line.x"},
+            "y": {"name": "active", "description": "bool запрещён для line.y"},
+            "sort": [{"by": "x", "dir": "asc"}],
+            "limit": 5001,
+        }
+    )
+    line_val = engine.validate(bad_line, SCHEMA)
+    line_errs = {(e.field, e.reason) for e in line_val.errors}
+    if not {
+        ("x.name", "type_mismatch"),
+        ("y.name", "type_mismatch"),
+        ("sort", "unsupported_operation"),
+        ("limit", "invalid_parameter"),
+    }.issubset(line_errs):
+        return False
+
+    bad_scatter = engine.from_dict(
+        {
+            "type": "scatter",
+            "title": "Невалидный scatter",
+            "x": {"name": "created_at", "description": "date запрещён для scatter.x"},
+            "y": {"name": "revenue", "description": ""},
+            "sort": [],
+            "limit": 0,
+        }
+    )
+    scatter_val = engine.validate(bad_scatter, SCHEMA)
+    scatter_errs = {(e.field, e.reason) for e in scatter_val.errors}
+    if not {
+        ("x.name", "type_mismatch"),
+        ("sort", "unsupported_operation"),
+        ("limit", "invalid_parameter"),
+    }.issubset(scatter_errs):
+        return False
+
+    bad_card = engine.from_dict(
+        {
+            "type": "card",
+            "title": "Невалидный card",
+            "value": {"name": "created_at", "description": "date запрещён для card"},
+            "sort": [{"by": "value", "dir": "desc"}],
+            "limit": 1,
+        }
+    )
+    card_val = engine.validate(bad_card, SCHEMA)
+    card_errs = {(e.field, e.reason) for e in card_val.errors}
+    return {
+        ("value.name", "type_mismatch"),
+        ("sort", "unsupported_operation"),
+        ("limit", "unsupported_operation"),
+    }.issubset(card_errs)
+
+
+def test_table_columns_and_sort_scope_validation() -> bool:
+    engine = ChartEngine()
+
+    empty_cols_table = engine.from_dict(
+        {
+            "type": "table",
+            "title": "Пустые колонки",
+            "columns": [],
+        }
+    )
+    if engine.validate(empty_cols_table, SCHEMA).ok:
+        return False
+
+    scoped_table = engine.from_dict(
+        {
+            "type": "table",
+            "title": "Сортировка по колонке вне списка columns и по оси x",
+            "columns": [
+                {"name": "id", "description": ""},
+                {"name": "missing_col", "description": ""},
+            ],
+            "sort": [
+                {"by": "revenue", "dir": "desc"},
+                {"by": "x", "dir": "asc"},
+            ],
+            "limit": 10001,
+        }
+    )
+    val = engine.validate(scoped_table, SCHEMA)
+    if val.ok:
+        return False
+
+    err_set = {(e.field, e.reason) for e in val.errors}
+    expected = {
+        ("columns[1].name", "column_not_found"),
+        ("sort[0].by", "invalid_parameter"),
+        ("sort[1].by", "invalid_parameter"),
+        ("limit", "invalid_parameter"),
+    }
+    return expected.issubset(err_set)
+
+
+def test_structural_parse_errors_and_schema_validation() -> bool:
+    engine = ChartEngine()
+
+    non_dict = engine.from_dict(["not", "a", "dict"])  # type: ignore[arg-type]
+    if engine.validate(non_dict, SCHEMA).ok:
+        return False
+
+    unknown_type = engine.from_dict({"type": "pie", "title": "Круговая диаграмма"})
+    unknown_val = engine.validate(unknown_type, SCHEMA)
+    if unknown_val.ok or not any(
+        e.field == "type"
+        and e.reason == "unsupported_operation"
+        and e.valid_options == ["bar", "card", "line", "scatter", "table"]
+        for e in unknown_val.errors
+    ):
+        return False
+
+    malformed_bar = engine.from_dict(
+        {
+            "type": "bar",
+            "title": "   ",
+            "x": "status_as_string_instead_of_object",
+            "y": {"name": "   ", "description": ""},
+            "sort": "not_a_list",
+            "limit": True,
+        }
+    )
+    malformed_val = engine.validate(
+        malformed_bar,
+        {"status": "str", "bad_col": "decimal"},
+        row_count=-5,
+    )
+    if malformed_val.ok:
+        return False
+
+    err_set = {(e.field, e.reason) for e in malformed_val.errors}
+    expected = {
+        ("schema.bad_col", "invalid_parameter"),
+        ("row_count", "invalid_parameter"),
+        ("title", "invalid_parameter"),
+        ("x", "invalid_parameter"),
+        ("y.name", "invalid_parameter"),
+        ("sort", "invalid_parameter"),
+        ("limit", "invalid_parameter"),
+    }
+    return expected.issubset(err_set)
+
+
+def main() -> None:
+    cnt = 0
+    tests = [
+        [test_all_charts_roundtrip_and_valid_types, True],
+        [test_multi_level_sort_stability_dates_and_nulls, True],
+        [test_catalog_completeness_and_prompt_formats, True],
+        [test_bar_validation_boundaries_and_cardinality, True],
+        [test_line_scatter_card_specific_constraints, True],
+        [test_table_columns_and_sort_scope_validation, True],
+        [test_structural_parse_errors_and_schema_validation, True],
+    ]
+
+    for idx, (test_fn, expected) in enumerate(tests, start=1):
+        actual = test_fn()
+        passed = actual == expected
+        if passed:
+            cnt += 1
+        status = "OK" if passed else "FAIL"
+        print(
+            f"[{idx}/{len(tests)}] {test_fn.__name__}: {status} (got {actual}, expected {expected})"
+        )
+
+    print(f"\nPassed: {cnt}/{len(tests)}")
+
+
+if __name__ == "__main__":
+    main()
