@@ -4,3 +4,9 @@
 # Python
 /.venv/
 __pycache__/
+
+.env
+.env.*
+!.env.example
+*.py[cod]
+.venv/
