@@ -90,6 +90,7 @@ BAR_TYPE_SPEC: ChartTypeSpec = ChartTypeSpec(
 @dataclass(frozen=True)
 class BarChart(ChartBase):
     """Bar chart implementation comparing discrete categories by a numeric metric."""
+
     name: str = field(default="bar", init=False)
     title: str
     x: ColumnRef
@@ -120,6 +121,7 @@ class BarChart(ChartBase):
         )
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize the bar chart specification to a dictionary."""
         payload: dict[str, Any] = {
             "type": "bar",
             "title": self.title,
@@ -137,6 +139,7 @@ class BarChart(ChartBase):
         schema: dict[str, str],
         row_count: int | None = None,
     ) -> list[ValidationError]:
+        """Validate bar chart parameters, column types, sort keys, and limit."""
         errors: list[ValidationError] = list(self.parse_errors)
 
         validate_title_value("bar", self.title, errors)
@@ -145,30 +148,14 @@ class BarChart(ChartBase):
         validate_sort_specs("bar", self.sort, BAR_SORT_TARGETS, errors)
         validate_limit_value("bar", self.limit, MAX_LIMIT, errors)
 
-        if (
-            row_count is not None
-            and not isinstance(row_count, bool)
-            and isinstance(row_count, int)
-            and row_count > MAX_LIMIT
-        ):
-            errors.append(
-                ValidationError(
-                    step_index=0,
-                    var="bar",
-                    reason="too_many_categories",
-                    field="row_count",
-                    value=str(row_count),
-                    valid_options=[str(MAX_LIMIT)],
-                )
-            )
-
         return errors
 
     def matplotlib_out(self, data: list[dict[str, Any]]) -> bytes:
+        """Render the bar chart into PNG bytes."""
         if not data:
             return render_empty_figure(self.title)
 
-        rows = list(data)
+        rows = [r for r in data if r.get(self.y.name) is not None]
         rows = apply_multi_level_sort(
             rows,
             self.sort,
@@ -181,13 +168,10 @@ class BarChart(ChartBase):
             return render_empty_figure(self.title)
 
         x_labels = [
-            str(r.get(self.x.name, "")) if r.get(self.x.name) is not None else ""
+            str(r[self.x.name]) if r.get(self.x.name) is not None else ""
             for r in rows
         ]
-        y_values = [
-            float(r[self.y.name]) if r.get(self.y.name) is not None else 0.0
-            for r in rows
-        ]
+        y_values = [float(r[self.y.name]) for r in rows]
 
         fig, ax = plt.subplots(figsize=FIGURE_SIZE, dpi=FIGURE_DPI)
         ax.bar(x_labels, y_values)

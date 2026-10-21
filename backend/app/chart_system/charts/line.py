@@ -79,6 +79,7 @@ LINE_TYPE_SPEC: ChartTypeSpec = ChartTypeSpec(
 @dataclass(frozen=True)
 class LineChart(ChartBase):
     """Line chart implementation for time series and ordered progressions."""
+
     name: str = field(default="line", init=False)
     title: str
     x: ColumnRef
@@ -107,6 +108,7 @@ class LineChart(ChartBase):
         )
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize the line chart specification to a dictionary."""
         payload: dict[str, Any] = {
             "type": "line",
             "title": self.title,
@@ -122,6 +124,7 @@ class LineChart(ChartBase):
         schema: dict[str, str],
         row_count: int | None = None,
     ) -> list[ValidationError]:
+        """Validate line chart parameters, column types, and limit."""
         errors: list[ValidationError] = list(self.parse_errors)
 
         validate_title_value("line", self.title, errors)
@@ -132,18 +135,19 @@ class LineChart(ChartBase):
         return errors
 
     def matplotlib_out(self, data: list[dict[str, Any]]) -> bytes:
+        """Render the line chart into PNG bytes."""
         if not data:
             return render_empty_figure(self.title)
 
-        rows = list(data)
         rows = [
             r
-            for r in rows
+            for r in data
             if r.get(self.x.name) is not None and r.get(self.y.name) is not None
         ]
+        rows.sort(key=lambda r: r[self.x.name])
+
         effective_limit = self.limit if self.limit is not None else DEFAULT_LIMIT
         rows = rows[:effective_limit]
-
 
         if not rows:
             return render_empty_figure(self.title)

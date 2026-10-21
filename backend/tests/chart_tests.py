@@ -180,10 +180,16 @@ def test_bar_validation_boundaries_and_cardinality() -> bool:
     if not engine.validate(engine.from_dict(base_bar), SCHEMA, row_count=200).ok:
         return False
 
-    card_fail = engine.validate(engine.from_dict(base_bar), SCHEMA, row_count=201)
-    if card_fail.ok or not any(
-        e.reason == "too_many_categories" and e.value == "201" and e.valid_options == ["200"]
-        for e in card_fail.errors
+    if not engine.validate(engine.from_dict(base_bar), SCHEMA, row_count=201).ok:
+        return False
+
+    if not engine.validate(engine.from_dict(base_bar), SCHEMA, row_count=5000).ok:
+        return False
+
+    bad_rc = engine.validate(engine.from_dict(base_bar), SCHEMA, row_count=-5)
+    if bad_rc.ok or not any(
+        e.field == "row_count" and e.reason == "invalid_parameter"
+        for e in bad_rc.errors
     ):
         return False
 

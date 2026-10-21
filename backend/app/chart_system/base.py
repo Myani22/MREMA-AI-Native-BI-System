@@ -26,6 +26,7 @@ FIGURE_DPI: int = 100
 @dataclass(frozen=True)
 class ParamSpec:
     """Specification of a single chart parameter for catalog documentation."""
+
     name: str
     type: str
     required: bool
@@ -35,6 +36,7 @@ class ParamSpec:
 @dataclass(frozen=True)
 class ChartTypeSpec:
     """Catalog specification for a chart type."""
+
     name: str
     description: str
     when_to_use: str
@@ -45,6 +47,7 @@ class ChartTypeSpec:
 @dataclass(frozen=True)
 class ColumnRef:
     """Reference to an output column produced by the query engine."""
+
     name: str
     description: str = ""
 
@@ -59,6 +62,7 @@ class ColumnRef:
 @dataclass(frozen=True)
 class SortSpec:
     """Single sorting rule for chart data."""
+
     by: str
     dir: str
 
@@ -72,6 +76,7 @@ class SortSpec:
 
 class ChartBase(ABC):
     """Abstract base class for a chart specification and renderer."""
+
     name: str = ""
 
     @classmethod
@@ -115,6 +120,25 @@ class ChartBase(ABC):
                 )
             target_cls = CHART_REGISTRY[raw_type]
         else:
+            expected_type = next(
+                (k for k, v in CHART_REGISTRY.items() if v is cls),
+                None,
+            )
+            if expected_type is not None and raw_type != expected_type:
+                parse_errors.append(
+                    ValidationError(
+                        step_index=0,
+                        var=str(raw_type) if raw_type is not None else "",
+                        reason="unsupported_operation",
+                        field="type",
+                        value=str(raw_type) if raw_type is not None else None,
+                        valid_options=[expected_type],
+                    )
+                )
+                return InvalidChart(
+                    raw_data=dict(data),
+                    parse_errors=tuple(parse_errors),
+                )
             target_cls = cls
 
         return target_cls._parse(data, parse_errors)
@@ -148,6 +172,7 @@ class ChartBase(ABC):
 @dataclass(frozen=True)
 class InvalidChart(ChartBase):
     """Fallback representation for a chart specification with unrecoverable parse errors."""
+
     name: str = ""
     raw_data: dict[str, Any] = field(default_factory=dict)
     parse_errors: tuple[ValidationError, ...] = ()
@@ -532,10 +557,12 @@ def apply_multi_level_sort(
 
 def figure_to_png_bytes(fig: Figure) -> bytes:
     """Serialize a matplotlib Figure into PNG bytes and close the figure."""
-    buf = BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight")
-    plt.close(fig)
-    return buf.getvalue()
+    try:
+        buf = BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        return buf.getvalue()
+    finally:
+        plt.close(fig)
 
 
 def render_empty_figure(title: str) -> bytes:
