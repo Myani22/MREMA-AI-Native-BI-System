@@ -1,16 +1,17 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
+    container_name: mrema-postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-mrema}
       POSTGRES_USER: ${POSTGRES_USER:-mrema}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mrema_dev_password}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - mrema_postgres_data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mrema} -d ${POSTGRES_DB:-mrema}"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -20,7 +21,7 @@ services:
     build:
       context: ./backend
     environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-mrema}:${POSTGRES_PASSWORD:-mrema_dev_password}@postgres:5432/${POSTGRES_DB:-mrema}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-mrema}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-mrema}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:3000}
     ports:
@@ -31,4 +32,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  postgres_data:
+  mrema_postgres_data:
