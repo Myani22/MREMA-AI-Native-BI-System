@@ -11,4 +11,5 @@ __pycache__/
 *.py[cod]
 .venv/
 
-sample.csv
+# from tests/usage
+chart_plots/

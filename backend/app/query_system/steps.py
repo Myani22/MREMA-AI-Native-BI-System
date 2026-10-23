@@ -190,6 +190,22 @@ class Step(ABC):
                 )
             target_cls = STEP_REGISTRY[raw_op]
         else:
+            if cls.op and raw_op != cls.op:
+                parse_errors.append(
+                    ValidationError(
+                        step_index=0,
+                        var=var_name,
+                        reason="unsupported_operation",
+                        field="op",
+                        value=str(raw_op) if raw_op is not None else None,
+                        valid_options=[cls.op],
+                    )
+                )
+                return InvalidStep(
+                    var=var_name,
+                    raw_data=dict(data),
+                    parse_errors=tuple(parse_errors),
+                )
             target_cls = cls
 
         step = target_cls._parse(var_name, data, parse_errors)
