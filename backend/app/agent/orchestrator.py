@@ -1,8 +1,11 @@
 from __future__ import annotations
+from .chart_planner import plan_charts, ChartPlanItem
+from .integrations.charts import SUPPORTED_CHART_TYPES
 
 import asyncio
 import logging
 import time
+import re
 import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
@@ -141,6 +144,13 @@ def _title(question: str, limit: int = 90) -> str:
     q = question.strip().rstrip("?").strip()
     return q if len(q) <= limit else q[: limit - 1].rstrip() + "…"
 
+_MULTI_RE = re.compile(
+    r"сравн|обзор|несколько|дашборд|панел|отчёт|отчет|покажи\s+всё|покажи\s+все",
+    re.I,
+)
+
+def _looks_multi_chart(text: str) -> bool:
+    return bool(_MULTI_RE.search(text))
 
 class Agent:
     def __init__(
@@ -280,8 +290,74 @@ class Agent:
                 return await self._follow_up(run, decision, turn, router)
             case Intent.CREATE_DASHBOARD:
                 return await self._dashboard(run, decision, turn, message)
+            case _ if decision.intent in ANALYTIC_INTENTS and (
+                decision.wants_chart
+                or _looks_multi_chart(decision.standalone_question)
+            ):
+                return await self._answer_chart_first(run, decision.standalone_question, turn)
             case _:
                 return await self._answer(run, decision, turn)
+
+    async def _answer_chart_first(self, run: "_Run", question: str, turn: Turn) -> AgentResponse:
+        """LLM сначала планирует графики, потом под каждый генерит запрос."""
+        await self._status(run, "planning", "Планирую визуализации")
+        allowed = set(self.config.chart_types or SUPPORTED_CHART_TYPES)
+        plan = await plan_charts(
+            run.llm, question, run.catalog,
+            allowed_types=allowed,
+            max_attempts=self.config.max_structured_attempts,
+            max_tables=self.config.max_schema_tables,
+            max_columns=self.config.max_schema_columns,
+        )
+        blocks: list[Block] = []
+        summaries: list[str] = []
+        titles: list[str] = []
+        for item in plan.charts:
+            chart_question = (
+                f"{question}\n\n"
+                f"Собери данные для графика «{item.title}» ({item.chart_type.value}): "
+                f"{item.data_requirement}"
+            )
+            try:
+                execution = await self._execute(run, Intent.DATA_QUESTION, chart_question)
+            except _EarlyReply as e:
+                run.trace.warnings.append(f"график «{item.title}» пропущен: {e.text}")
+                continue
+            if execution.result.status is not ToolStatus.OK:
+                continue
+            chart, note = choose_chart(
+                execution.result.table,
+                hint=execution.result.chart_hint,
+                requested=item.chart_type,
+                title=item.title,
+                allowed=self.config.chart_types,
+            )
+            if chart is None:
+                chart, note = choose_chart(
+                    execution.result.table,
+                    hint=execution.result.chart_hint,
+                    title=item.title,
+                    allowed=self.config.chart_types,
+                )
+                note = (note or "") + " (запрошенный тип недоступен для этих данных)"
+            artifact = self._store_artifact(
+                run, Intent.DATA_QUESTION, chart_question, execution, chart
+            )
+            blocks.append(TextBlock(markdown=f"**{item.title}**"))
+            blocks.extend(self._result_blocks(artifact, note))
+            if execution.result.summary_text:
+                summaries.append(execution.result.summary_text)
+            titles.append(item.title)
+
+        if not blocks:
+            raise _EarlyReply(
+                "clarification",
+                "Не удалось построить ни один график. Уточните, какие показатели нужны?",
+                self._examples(run.catalog),
+            )
+        turn.summary = " ".join(summaries)[:400] or "Готово."
+        turn.points = titles
+        return self._respond(run, "ok", blocks)
 
     async def _answer(self, run: _Run, decision: IntentDecision, turn: Turn) -> AgentResponse:
         question = decision.standalone_question

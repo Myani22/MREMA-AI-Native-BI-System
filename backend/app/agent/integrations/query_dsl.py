@@ -236,17 +236,35 @@ class QueryDslTool(BaseTool):
         self.engine = QueryEngine()
 
     async def run(self, args: QueryArgs, ctx: ToolContext) -> ToolResult:
+        from .dsl_to_sql import compile_dsl_to_sql
+        from ..contracts.catalog import Catalog
         payload = args.to_engine()
         query = self.engine.from_dict(payload)
         validation = self.engine.validate(query, self._schema())
         if not validation.ok:
             return ToolResult(status=ToolStatus.RETRYABLE_ERROR, error=format_errors(validation.errors))
-        table = await asyncio.to_thread(self.engine.execute, query, self._sources())
-        rows = table.to_dicts()
-        schema = validation.output_schema or {c: "str" for c in table.columns}
+        if ctx.executor is not None:
+            try:
+                sql = compile_dsl_to_sql(
+                    args,
+                    table_map={t.name: t.name for t in ctx.catalog.tables},
+                )
+                raw = await ctx.executor.execute(sql, max_rows=self.max_rows)
+                rows = [dict(zip(raw.columns, r)) for r in raw.rows]
+                schema = {c: "str" for c in raw.columns}  # типы не критичны для table
+                # Приводим к семантике через output_schema движка
+                schema = {**schema, **(validation.output_schema or {})}
+            except Exception as e:
+                return ToolResult(status=ToolStatus.RETRYABLE_ERROR, error=f"SQL: {e}")
+        else:
+            table = await asyncio.to_thread(self.engine.execute, query, self._sources())
+            rows = table.to_dicts()
+            schema = validation.output_schema or {c: "str" for c in table.columns}
+
         query_text = json.dumps(payload, ensure_ascii=False)
         if not rows:
-            return ToolResult(status=ToolStatus.EMPTY, sql=query_text, summary_text="По этому запросу строк не нашлось.")
+            return ToolResult(status=ToolStatus.EMPTY, sql=query_text,
+                              summary_text="По этому запросу строк не нашлось.")
         result_table = to_result_table(rows, schema, self.max_rows)
         facts: dict[str, Any] = {"строк_в_результате": len(rows)}
         if len(rows) == 1:
