@@ -20,6 +20,7 @@ services:
   backend:
     build:
       context: ./backend
+    env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-mrema}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-mrema}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}

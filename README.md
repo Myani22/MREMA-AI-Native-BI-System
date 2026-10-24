@@ -29,7 +29,19 @@ Preview the first 20 rows (replace 1 with returned id):
 curl "http://localhost:8000/api/datasets/1/preview?limit=20&offset=0"
 ```
 
-## 3. Important notes before using with real hackathon data
+## 3. Run a frontend
+
+Requires Streamlit:
+```bash
+pip install streamlit
+```
+
+Then from the repo root:
+```bash
+streamlit run ./frontend/main.py
+```
+
+## 4. Important notes before using with real hackathon data
 - This initial implementation reads each CSV into a pandas DataFrame. It is appropriate for a first integration test, not an unlimited-size ingestion service.
 - The import endpoint has a configurable upload limit but currently buffers the upload in memory. Use streaming/chunked ingestion for larger files.
 - Pandas infers SQL column types. Inspect and harden this for identifiers with leading zeros, mixed-type columns, locale-specific decimals, unusual encodings and malformed rows.
