@@ -290,15 +290,23 @@ class Agent:
                 return await self._follow_up(run, decision, turn, router)
             case Intent.CREATE_DASHBOARD:
                 return await self._dashboard(run, decision, turn, message)
-            case _ if decision.intent in ANALYTIC_INTENTS and (
-                decision.wants_chart
-                or _looks_multi_chart(decision.standalone_question)
+            case _ if decision.intent in {
+                Intent.DATA_QUESTION,
+                Intent.TIME_PATTERNS,
+                Intent.SEGMENT_COMPARE,
+                Intent.CORRELATION,
+            } and (
+                decision.wants_chart or _looks_multi_chart(decision.standalone_question)
             ):
-                return await self._answer_chart_first(run, decision.standalone_question, turn)
+                return await self._answer_chart_first(
+                    run, decision.standalone_question, turn, decision.intent
+                )
             case _:
                 return await self._answer(run, decision, turn)
 
-    async def _answer_chart_first(self, run: "_Run", question: str, turn: Turn) -> AgentResponse:
+    async def _answer_chart_first(
+        self, run: "_Run", question: str, turn: Turn, intent: Intent
+    ) -> AgentResponse:
         """LLM сначала планирует графики, потом под каждый генерит запрос."""
         await self._status(run, "planning", "Планирую визуализации")
         allowed = set(self.config.chart_types or SUPPORTED_CHART_TYPES)
@@ -319,7 +327,7 @@ class Agent:
                 f"{item.data_requirement}"
             )
             try:
-                execution = await self._execute(run, Intent.DATA_QUESTION, chart_question)
+                execution = await self._execute(run, intent, chart_question)
             except _EarlyReply as e:
                 run.trace.warnings.append(f"график «{item.title}» пропущен: {e.text}")
                 continue
@@ -576,6 +584,9 @@ class Agent:
         if feedback is not None:
             content += ARGS_FEEDBACK.format(args=feedback[0].model_dump_json(), error=feedback[1])
         llm = run.sql_llm if tool.llm_role == "sql" else run.llm
+        def _preprocess(data: dict) -> dict:
+            data = fix_catalog_refs(data, fields, all_tables, all_columns)
+            return tool.preprocess_args(data, catalog)  
         return await generate_structured(
             llm,
             [system_msg(prompt), user_msg(content)],
@@ -583,7 +594,7 @@ class Agent:
             schema=schema,
             schema_name=f"args_{tool.name}",
             max_attempts=self.config.max_structured_attempts,
-            preprocess=lambda data: fix_catalog_refs(data, fields, all_tables, all_columns),
+            preprocess=_preprocess,
             validate=lambda args: check_catalog_refs(args, fields, catalog),
         )
 

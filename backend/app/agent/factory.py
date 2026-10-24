@@ -48,8 +48,6 @@ def build_agent(*, config=None, llm=None, sql_llm=None, data_dir=None):
         from app.db import engine  # SQLAlchemy engine
         catalog_provider = PostgresCatalogProvider(engine)
         executor = PostgresQueryExecutor(engine)
-        # для загрузки CSV через /api/datasets
-        from .integrations.csv_store import InMemoryCsvStore
         store = InMemoryCsvStore()  # fallback, но каталог берётся из PG
     else:
         data_dir = data_dir if data_dir is not None else os.environ.get("DATA_DIR")

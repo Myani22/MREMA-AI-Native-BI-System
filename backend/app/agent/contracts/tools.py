@@ -72,6 +72,9 @@ class BaseTool(ABC):
     @abstractmethod
     async def run(self, args: BaseModel, ctx: ToolContext) -> ToolResult: ...
 
+    def preprocess_args(self, data: dict, catalog: Catalog) -> dict:
+        return data
+
 
 class ToolRegistry:
     def __init__(self, tools: list[BaseTool] | None = None):

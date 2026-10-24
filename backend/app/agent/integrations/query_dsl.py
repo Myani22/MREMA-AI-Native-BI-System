@@ -164,6 +164,9 @@ def format_errors(errors: list[ValidationError], limit: int = 6) -> str:
 
 def _steps_hint() -> str:
     lines = [
+        "Не оборачивай имена колонок в кавычки — пиши их как есть: Уровень программы лояльности, а не \"Уровень программы лояльности\".",
+        "Копируй имена колонок точно из схемы, включая кириллицу и пробелы. Не переводи на английский: если в схеме «Статус», а не «status», пиши «Статус».",
+        "Никакой арифметики: нельзя писать column=\"Количество * Цена\" или \"A + B\". Можно только выбрать колонку и применить одну агрегатную функцию (sum/avg/min/max/count).",
         "Строй запрос как список шагов steps; каждый шаг создаёт переменную var и ссылается только на переменные выше.",
         "Колонки называй точно как в схеме, в том числе русские названия с пробелами и запятыми.",
         "Для дат по месяцам и годам используй колонки «... (месяц)» и «... (год)».",
@@ -234,6 +237,10 @@ class QueryDslTool(BaseTool):
         self._sources = sources
         self.max_rows = max_rows
         self.engine = QueryEngine()
+
+    def preprocess_args(self, data: dict, catalog) -> dict:
+        from ..catalog_refs import fix_query_args_columns
+        return fix_query_args_columns(data, catalog)
 
     async def run(self, args: QueryArgs, ctx: ToolContext) -> ToolResult:
         from .dsl_to_sql import compile_dsl_to_sql
