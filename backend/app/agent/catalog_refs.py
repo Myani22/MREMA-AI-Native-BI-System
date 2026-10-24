@@ -10,6 +10,17 @@ from .contracts.tools import CATALOG_KEY
 from .llm.structured import model_schema
 
 
+_QUOTE_PAIRS = (('"', '"'), ("«", "»"), ("'", "'"), ("`", "`"))
+
+
+def _strip_quotes(value: str) -> str:
+    v = value.strip()
+    for left, right in _QUOTE_PAIRS:
+        if len(v) >= 2 and v.startswith(left) and v.endswith(right):
+            return v[1:-1].strip()
+    return v
+
+
 def catalog_fields(args_model: type[BaseModel]) -> dict[str, str]:
     props = args_model.model_json_schema().get("properties", {})
     return {name: prop[CATALOG_KEY] for name, prop in props.items() if CATALOG_KEY in prop}
@@ -47,6 +58,7 @@ def build_args_schema(args_model: type[BaseModel], tables: list[str], columns: l
 
 
 def _closest(value: str, allowed: list[str]) -> str | None:
+    value = _strip_quotes(value)
     lowered = {a.lower(): a for a in allowed}
     if value.lower() in lowered:
         return lowered[value.lower()]
@@ -55,6 +67,7 @@ def _closest(value: str, allowed: list[str]) -> str | None:
 
 
 def _fix_column(value: str, allowed: list[str]) -> str:
+    value = _strip_quotes(value)
     if value in allowed:
         return value
     by_column = [ref for ref in allowed if split_column_ref(ref)[1].lower() == value.lower()]
@@ -91,3 +104,66 @@ def check_catalog_refs(args: BaseModel, fields: dict[str, str], catalog: Catalog
                 hints = difflib.get_close_matches(v, allowed, n=3, cutoff=0.4) or allowed[:8]
                 errors.append(f"{name}: «{v}» нет в данных, допустимые варианты: {', '.join(hints)}")
     return errors
+
+
+def _fix_condition_columns(cond: Any, fixer: callable) -> Any:
+    if not isinstance(cond, dict):
+        return cond
+    if "column" in cond and isinstance(cond["column"], str):
+        return {**cond, "column": fixer(cond["column"])}
+    for op in ("and", "or"):
+        if op in cond and isinstance(cond[op], list):
+            return {op: [_fix_condition_columns(c, fixer) for c in cond[op]]}
+    if "not" in cond:
+        return {"not": _fix_condition_columns(cond["not"], fixer)}
+    return cond
+
+
+def fix_query_args_columns(data: Any, catalog: Catalog) -> Any:
+    """Walk DSL steps and fuzzy-fix every column reference."""
+    if not isinstance(data, dict) or "steps" not in data:
+        return data
+    plain: dict[str, str] = {split_column_ref(ref)[1]: ref for ref in catalog.column_refs()}
+    allowed = list(plain)
+
+    def fixer(name: Any) -> Any:
+        if not isinstance(name, str):
+            return name
+        clean = _strip_quotes(name)
+        if clean in plain:
+            return plain[clean]
+        match = _closest(clean, allowed)
+        return plain.get(match, clean) if match else clean
+
+    fixed_steps: list[Any] = []
+    for step in data.get("steps", []):
+        if not isinstance(step, dict):
+            fixed_steps.append(step)
+            continue
+        s = dict(step)
+        if isinstance(s.get("group_by"), list):
+            s["group_by"] = [fixer(g) for g in s["group_by"]]
+        if isinstance(s.get("columns"), list):
+            s["columns"] = [fixer(c) for c in s["columns"]]
+        if isinstance(s.get("aggregates"), list):
+            s["aggregates"] = [
+                {**a, "column": fixer(a["column"])} if isinstance(a, dict) and "column" in a else a
+                for a in s["aggregates"]
+            ]
+        if isinstance(s.get("by"), list):
+            s["by"] = [
+                {**k, "column": fixer(k["column"])} if isinstance(k, dict) and "column" in k else k
+                for k in s["by"]
+            ]
+        if isinstance(s.get("on"), list):
+            s["on"] = [
+                {**p, "left_col": fixer(p["left_col"]), "right_col": fixer(p["right_col"])}
+                if isinstance(p, dict) else p
+                for p in s["on"]
+            ]
+        if "condition" in s:
+            s["condition"] = _fix_condition_columns(s["condition"], fixer)
+        if "having" in s and s["having"]:
+            s["having"] = _fix_condition_columns(s["having"], fixer)
+        fixed_steps.append(s)
+    return {**data, "steps": fixed_steps}

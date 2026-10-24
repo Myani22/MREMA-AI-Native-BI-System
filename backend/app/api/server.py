@@ -89,7 +89,7 @@ def create_app(bundle: AgentBundle | None = None) -> FastAPI:
             status="ok",
             model=getattr(config, "model", None),
             structured_mode=str(mode) if mode else None,
-            tables=len(bundle.store.catalog().tables),
+            tables = len((await agent.catalog_provider.get_catalog()).tables),
         )
 
     @app.post("/api/chat", response_model=AgentResponse)
@@ -131,7 +131,7 @@ def create_app(bundle: AgentBundle | None = None) -> FastAPI:
 
     @app.get("/api/catalog", response_model=Catalog)
     async def catalog() -> Catalog:
-        return bundle.store.catalog()
+        return await agent.catalog_provider.get_catalog()
 
     @app.post("/api/datasets", response_model=TableInfo)
     async def upload_dataset(file: UploadFile) -> TableInfo:
@@ -176,6 +176,24 @@ def create_app(bundle: AgentBundle | None = None) -> FastAPI:
         except ValueError as e:
             raise HTTPException(422, str(e)) from e
         return Response(content=png, media_type="image/png")
+
+    @app.post("/api/datasets/import-db")
+    async def import_db(payload: dict):
+        from sqlalchemy import create_engine
+        from app.agent.integrations.postgres_store import (
+            PostgresCatalogProvider,
+            PostgresQueryExecutor,
+        )
+        url = payload["url"]
+        schema = payload.get("schema", "public")
+        pg_engine = create_engine(
+            url, pool_pre_ping=True, connect_args={"connect_timeout": 5}
+        )
+        provider = PostgresCatalogProvider(pg_engine, schema=schema)
+        agent.catalog_provider = provider
+        agent.executor = PostgresQueryExecutor(pg_engine)
+        catalog = await provider.get_catalog()
+        return {"status": "ok", "tables": len(catalog.tables)}
 
     return app
 

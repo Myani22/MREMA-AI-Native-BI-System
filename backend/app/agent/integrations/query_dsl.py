@@ -164,6 +164,9 @@ def format_errors(errors: list[ValidationError], limit: int = 6) -> str:
 
 def _steps_hint() -> str:
     lines = [
+        "Не оборачивай имена колонок в кавычки — пиши их как есть: Уровень программы лояльности, а не \"Уровень программы лояльности\".",
+        "Копируй имена колонок точно из схемы, включая кириллицу и пробелы. Не переводи на английский: если в схеме «Статус», а не «status», пиши «Статус».",
+        "Никакой арифметики: нельзя писать column=\"Количество * Цена\" или \"A + B\". Можно только выбрать колонку и применить одну агрегатную функцию (sum/avg/min/max/count).",
         "Строй запрос как список шагов steps; каждый шаг создаёт переменную var и ссылается только на переменные выше.",
         "Колонки называй точно как в схеме, в том числе русские названия с пробелами и запятыми.",
         "Для дат по месяцам и годам используй колонки «... (месяц)» и «... (год)».",
@@ -235,18 +238,40 @@ class QueryDslTool(BaseTool):
         self.max_rows = max_rows
         self.engine = QueryEngine()
 
+    def preprocess_args(self, data: dict, catalog) -> dict:
+        from ..catalog_refs import fix_query_args_columns
+        return fix_query_args_columns(data, catalog)
+
     async def run(self, args: QueryArgs, ctx: ToolContext) -> ToolResult:
+        from .dsl_to_sql import compile_dsl_to_sql
+        from ..contracts.catalog import Catalog
         payload = args.to_engine()
         query = self.engine.from_dict(payload)
         validation = self.engine.validate(query, self._schema())
         if not validation.ok:
             return ToolResult(status=ToolStatus.RETRYABLE_ERROR, error=format_errors(validation.errors))
-        table = await asyncio.to_thread(self.engine.execute, query, self._sources())
-        rows = table.to_dicts()
-        schema = validation.output_schema or {c: "str" for c in table.columns}
+        if ctx.executor is not None:
+            try:
+                sql = compile_dsl_to_sql(
+                    args,
+                    table_map={t.name: t.name for t in ctx.catalog.tables},
+                )
+                raw = await ctx.executor.execute(sql, max_rows=self.max_rows)
+                rows = [dict(zip(raw.columns, r)) for r in raw.rows]
+                schema = {c: "str" for c in raw.columns}  # типы не критичны для table
+                # Приводим к семантике через output_schema движка
+                schema = {**schema, **(validation.output_schema or {})}
+            except Exception as e:
+                return ToolResult(status=ToolStatus.RETRYABLE_ERROR, error=f"SQL: {e}")
+        else:
+            table = await asyncio.to_thread(self.engine.execute, query, self._sources())
+            rows = table.to_dicts()
+            schema = validation.output_schema or {c: "str" for c in table.columns}
+
         query_text = json.dumps(payload, ensure_ascii=False)
         if not rows:
-            return ToolResult(status=ToolStatus.EMPTY, sql=query_text, summary_text="По этому запросу строк не нашлось.")
+            return ToolResult(status=ToolStatus.EMPTY, sql=query_text,
+                              summary_text="По этому запросу строк не нашлось.")
         result_table = to_result_table(rows, schema, self.max_rows)
         facts: dict[str, Any] = {"строк_в_результате": len(rows)}
         if len(rows) == 1:

@@ -49,7 +49,7 @@ def _column_line(c: ColumnInfo) -> str:
         parts.append("напр.: " + ", ".join(v.value for v in c.top_values[:4]))
     elif c.sample_values:
         parts.append("напр.: " + ", ".join(c.sample_values[:3]))
-    line = f'  - "{c.name}" ({"; ".join(parts)})'
+    line = f'  - «{c.name}» ({"; ".join(parts)})'
     if c.display_name and c.display_name != c.name:
         line += f" — в файле «{c.display_name}»"
     if c.description:
@@ -64,7 +64,7 @@ def render_schema(catalog: Catalog, tables: list[str], *, max_columns: int = 60)
         t = catalog.table(name)
         if t is None:
             continue
-        header = f'Таблица "{t.name}"'
+        header = f'Таблица «{t.name}»'
         if t.display_name and t.display_name != t.name:
             header += f" («{t.display_name}»)"
         header += f", {t.row_count} строк"
@@ -80,7 +80,7 @@ def render_schema(catalog: Catalog, tables: list[str], *, max_columns: int = 60)
     if rels:
         lines.append("Связи:")
         lines.extend(
-            f'  - "{r.left_table}"."{r.left_column}" = "{r.right_table}"."{r.right_column}" ({r.cardinality})'
+            f'  - «{r.left_table}».«{r.left_column}» = «{r.right_table}».«{r.right_column}» ({r.cardinality})'
             for r in rels
         )
     return "\n".join(lines)
