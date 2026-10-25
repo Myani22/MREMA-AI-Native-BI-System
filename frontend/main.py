@@ -97,37 +97,57 @@ with st.sidebar:
         options=["В память", "В базу данных"]
     )
     
-    uploaded_file = st.file_uploader("CSV файл", type=["csv"])
+    uploaded_files = st.file_uploader("CSV файлы", type=["csv"], accept_multiple_files=True)
     
-    if uploaded_file and st.button("Загрузить", use_container_width=True):
-        with st.spinner("Загрузка..."):
-            files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "text/csv")}
-            
+    if uploaded_files and st.button("Загрузить", use_container_width=True):
+        with st.spinner("Загрузка файлов..."):
             endpoint = "/datasets/import" if "базу данных" in upload_mode else "/datasets"
-            try:
-                resp = requests.post(f"{API_URL}{endpoint}", files=files, timeout=60)
-                if resp.status_code in (200, 201):
-                    st.success("Файл успешно загружен")
-                else:
-                    st.error(f"Ошибка загрузки (Код {resp.status_code})")
-                    if debug_mode:
-                        with st.expander("Trace ошибки"):
-                            try:
-                                st.json(resp.json())
-                            except Exception:
-                                st.text(resp.text)
-            except requests.exceptions.Timeout:
-                st.error("Время ожидания загрузки файла превышено.")
-            except Exception as e:
-                st.error(f"Сетевая ошибка: {e}")
+            success_count = 0
+            
+            for file in uploaded_files:
+                files_payload = {"file": (file.name, file.getvalue(), "text/csv")}
+                try:
+                    resp = requests.post(f"{API_URL}{endpoint}", files=files_payload, timeout=60)
+                    if resp.status_code in (200, 201):
+                        success_count += 1
+                    else:
+                        st.error(f"Ошибка загрузки {file.name} (Код {resp.status_code})")
+                        if debug_mode:
+                            with st.expander(f"Trace ошибки {file.name}"):
+                                try:
+                                    st.json(resp.json())
+                                except Exception:
+                                    st.text(resp.text)
+                except requests.exceptions.Timeout:
+                    st.error(f"Таймаут загрузки: {file.name}")
+                except Exception as e:
+                    st.error(f"Сетевая ошибка ({file.name}): {e}")
+            
+            if success_count > 0:
+                st.success(f"Загружено файлов: {success_count} из {len(uploaded_files)}")
+                
+                if "базу данных" in upload_mode and DB_URL:
+                    with st.spinner("Автоматическая синхронизация БД..."):
+                        current_schema = st.session_state.get("db_schema_input", "data")
+                        payload = {"url": DB_URL, "schema": current_schema}
+                        
+                        try:
+                            sync_resp = requests.post(f"{API_URL}/datasets/import-db", json=payload, timeout=30)
+                            if sync_resp.status_code == 200:
+                                sync_data = sync_resp.json()
+                                st.success(f"БД обновлена! Всего таблиц: {sync_data.get('tables', 0)}")
+                            else:
+                                st.warning(f"Файлы загружены, но авто-синхронизация выдала ошибку (Код {sync_resp.status_code})")
+                        except Exception as e:
+                            st.warning(f"Файлы загружены, но авто-синхронизация не удалась: {e}")
                             
     if debug_mode:
         st.divider()
         if DB_URL:
             st.header("Синхронизация БД")
-            db_schema = st.text_input("Схема БД", value="data")
+            db_schema = st.text_input("Схема БД", value="data", key="db_schema_input")
             
-            if st.button("Синхронизировать БД", use_container_width=True):
+            if st.button("Синхронизировать БД вручную", use_container_width=True):
                 with st.spinner("Подключение к базе..."):
                     payload = {
                         "url": DB_URL,

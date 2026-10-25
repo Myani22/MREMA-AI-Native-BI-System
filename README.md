@@ -11,7 +11,7 @@ docker compose up --build
 ```
 
 API docs: http://localhost:8000/docs  
-Health: http://localhost:8000/health
+Health: http://localhost:8000/health  
 Frontend: http://localhost:8501
 
 ## 2. Import a CSV
