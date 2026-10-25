@@ -20,6 +20,7 @@ services:
   backend:
     build:
       context: ./backend
+    env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-mrema}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-mrema}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}
@@ -30,6 +31,17 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8501:8501"
+    environment:
+      BACKEND_URL: http://backend:8000/api
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-mrema}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-mrema}
+    depends_on:
+      - backend
+
 
 volumes:
   mrema_postgres_data:
