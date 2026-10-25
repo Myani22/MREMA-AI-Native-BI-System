@@ -101,12 +101,21 @@ class PostgresCatalogProvider:
                 columns: list[ColumnInfo] = []
                 for cname, ctype in cols:
                     kind = _dsl_type(ctype)
-                    stat = conn.execute(text(
-                        f'SELECT count(*) FILTER (WHERE "{cname}" IS NOT NULL), '
-                        f'count(DISTINCT "{cname}"), min("{cname}"), max("{cname}") '
-                        f'FROM "{self.schema}"."{tname}"'
-                    )).one()
-                    non_null, distinct, cmin, cmax = stat
+                    if kind in ("bool", "boolean", "BOOLEAN"):
+                        stat = conn.execute(text(
+                            f'SELECT count(*) FILTER (WHERE "{cname}" IS NOT NULL), '
+                            f'count(DISTINCT "{cname}") '
+                            f'FROM "{self.schema}"."{tname}"'
+                        )).one()
+                        non_null, distinct = stat[0], stat[1]
+                        cmin, cmax = None, None
+                    else:
+                        stat = conn.execute(text(
+                            f'SELECT count(*) FILTER (WHERE "{cname}" IS NOT NULL), '
+                            f'count(DISTINCT "{cname}"), min("{cname}"), max("{cname}") '
+                            f'FROM "{self.schema}"."{tname}"'
+                        )).one()
+                        non_null, distinct, cmin, cmax = stat
                     info = ColumnInfo(
                         name=cname,
                         db_type=kind,
