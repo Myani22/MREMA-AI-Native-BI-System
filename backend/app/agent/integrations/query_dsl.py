@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import Callable
 from datetime import date
@@ -8,7 +7,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.query_system import STEPS, QueryEngine, ValidationError
+from app.query_system import STEPS, ValidationError
 
 from ..contracts.catalog import SemanticType
 from ..contracts.response import ResultTable, TableColumn
@@ -164,8 +163,12 @@ def format_errors(errors: list[ValidationError], limit: int = 6) -> str:
 
 def _steps_hint() -> str:
     lines = [
+        "Не оборачивай имена колонок в кавычки — пиши их как есть: Уровень программы лояльности, а не \"Уровень программы лояльности\".",
+        "Копируй имена колонок точно из схемы, включая кириллицу и пробелы. Не переводи на английский: если в схеме «Статус», а не «status», пиши «Статус».",
+        "Никакой арифметики: нельзя писать column=\"Количество * Цена\" или \"A + B\". Можно только выбрать колонку и применить одну агрегатную функцию (sum/avg/min/max/count).",
         "Строй запрос как список шагов steps; каждый шаг создаёт переменную var и ссылается только на переменные выше.",
         "Колонки называй точно как в схеме, в том числе русские названия с пробелами и запятыми.",
+        "Имя таблицы пиши только в шаге source; в остальных шагах колонки без префикса таблицы: «price», а не «dataset_1.price».",
         "Для дат по месяцам и годам используй колонки «... (месяц)» и «... (год)».",
         "Вычисляемых колонок и SQL нет. Для «топ N» используй sort + limit.",
         "Операции:",
@@ -230,21 +233,28 @@ class QueryDslTool(BaseTool):
         *,
         max_rows: int = 1000,
     ):
-        self._schema = schema
-        self._sources = sources
+        from .dsl_exec import DslRunner
+
+        self.runner = DslRunner(schema, sources)
         self.max_rows = max_rows
-        self.engine = QueryEngine()
+
+    def preprocess_args(self, data: dict, catalog) -> dict:
+        from ..catalog_refs import fix_query_args_columns
+
+        return fix_query_args_columns(data, catalog)
 
     async def run(self, args: QueryArgs, ctx: ToolContext) -> ToolResult:
+        from .dsl_exec import DslRunError
+
         payload = args.to_engine()
-        query = self.engine.from_dict(payload)
-        validation = self.engine.validate(query, self._schema())
-        if not validation.ok:
-            return ToolResult(status=ToolStatus.RETRYABLE_ERROR, error=format_errors(validation.errors))
-        table = await asyncio.to_thread(self.engine.execute, query, self._sources())
-        rows = table.to_dicts()
-        schema = validation.output_schema or {c: "str" for c in table.columns}
+        try:
+            outcome = await self.runner.run(args, ctx, max_rows=self.max_rows)
+        except DslRunError as e:
+            return ToolResult(status=e.status, error=e.message)
+        rows, schema = outcome.rows, outcome.schema
         query_text = json.dumps(payload, ensure_ascii=False)
+        if outcome.sql:
+            query_text += "\n" + outcome.sql
         if not rows:
             return ToolResult(status=ToolStatus.EMPTY, sql=query_text, summary_text="По этому запросу строк не нашлось.")
         result_table = to_result_table(rows, schema, self.max_rows)

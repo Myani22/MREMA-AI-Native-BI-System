@@ -133,7 +133,7 @@ def test_end_to_end_with_real_engines(store, tmp_path):
         "intent_decision": [intent("data_question", "Сколько штук продано в каждом городе?")],
         "args_data_query": [
             {"steps": [{"var": "T", "op": "source", "table": "Продажи"},
-                       {"var": "A", "op": "aggregate", "input": "T", "group_by": ["Горд"],
+                       {"var": "A", "op": "aggregate", "input": "T", "group_by": ["Регион"],
                         "aggregates": [{"func": "sum", "column": "Количество, шт.", "alias": "Штук"}]}],
              "output": "A"},
             {"steps": [{"var": "T", "op": "source", "table": "Продажи"},
@@ -149,7 +149,7 @@ def test_end_to_end_with_real_engines(store, tmp_path):
     assert r.status == "ok", r.blocks
     assert [c.status for c in r.trace.tool_calls] == ["retryable_error", "ok"]
     args_prompt = llm.calls[1][1][0].content
-    assert '"Количество, шт."' in args_prompt and "aggregate" in args_prompt
+    assert '«Количество, шт.»' in args_prompt and "aggregate" in args_prompt
     chart = next(b for b in r.blocks if isinstance(b, ChartBlock))
     assert chart.spec.chart_type is ChartType.BAR and chart.engine_spec["type"] == "bar"
     assert next(b for b in r.blocks if isinstance(b, TableBlock)).data.rows[0] == ["Пермь", 13]

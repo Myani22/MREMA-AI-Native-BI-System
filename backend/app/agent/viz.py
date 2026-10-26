@@ -61,6 +61,7 @@ def candidates(
         add(ChartType.LINE, x, num[:1])
     elif len(num) >= 2:
         add(ChartType.SCATTER, num[0], [num[1]])
+        add(ChartType.LINE, num[0], [num[1]])
     elif len(num) == 1 and rows > 1:
         add(ChartType.HISTOGRAM, num[0], [])
     add(ChartType.TABLE, None, [])

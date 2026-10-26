@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from collections import defaultdict
@@ -12,9 +13,23 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from .catalog_refs import build_args_schema, catalog_fields, check_catalog_refs, fix_catalog_refs
+from .catalog_refs import (
+    build_args_schema,
+    catalog_fields,
+    check_catalog_refs,
+    fix_catalog_refs,
+)
+from .chart_planner import plan_charts
 from .config import AgentConfig
-from .contracts.catalog import TIME_TYPES, Catalog, CatalogProvider, QueryError, QueryExecutor, SemanticType, split_column_ref
+from .contracts.catalog import (
+    TIME_TYPES,
+    Catalog,
+    CatalogProvider,
+    QueryError,
+    QueryExecutor,
+    SemanticType,
+    split_column_ref,
+)
 from .contracts.dashboard import Dashboard, DashboardStore, DashboardWidget
 from .contracts.response import (
     CHART_LABELS,
@@ -37,6 +52,7 @@ from .contracts.response import (
     ToolCallTrace,
 )
 from .contracts.tools import BaseTool, ToolContext, ToolRegistry, ToolResult, ToolStatus
+from .integrations.charts import SUPPORTED_CHART_TYPES
 from .intents import ANALYTIC_INTENTS, Intent
 from .llm.client import ChatMessage, LLMClient, LLMReply, system_msg, user_msg
 from .llm.errors import LLMError, LLMUnavailableError, StructuredOutputError
@@ -141,6 +157,24 @@ def _title(question: str, limit: int = 90) -> str:
     q = question.strip().rstrip("?").strip()
     return q if len(q) <= limit else q[: limit - 1].rstrip() + "…"
 
+_MULTI_RE = re.compile(
+    r"сравн|обзор|несколько|дашборд|панел|отчёт|отчет|покажи\s+всё|покажи\s+все",
+    re.I,
+)
+
+def _looks_multi_chart(text: str) -> bool:
+    return bool(_MULTI_RE.search(text))
+
+
+_TWO_AXIS_CHARTS = frozenset({ChartType.LINE, ChartType.SCATTER, ChartType.AREA})
+
+
+def _widget_intent(intent: Intent, chart_type: ChartType | None) -> Intent:
+    if intent not in ANALYTIC_INTENTS:
+        return Intent.DATA_QUESTION
+    if intent is Intent.DISTRIBUTION and chart_type in _TWO_AXIS_CHARTS:
+        return Intent.DATA_QUESTION
+    return intent
 
 class Agent:
     def __init__(
@@ -280,8 +314,88 @@ class Agent:
                 return await self._follow_up(run, decision, turn, router)
             case Intent.CREATE_DASHBOARD:
                 return await self._dashboard(run, decision, turn, message)
+            case _ if decision.intent in {
+                Intent.DATA_QUESTION,
+                Intent.TIME_PATTERNS,
+                Intent.SEGMENT_COMPARE,
+                Intent.CORRELATION,
+            } and (
+                decision.wants_chart or _looks_multi_chart(decision.standalone_question)
+            ):
+                return await self._answer_chart_first(
+                    run, decision.standalone_question, turn, decision.intent, decision.chart_type
+                )
             case _:
                 return await self._answer(run, decision, turn)
+
+    async def _answer_chart_first(
+        self, run: _Run, question: str, turn: Turn, intent: Intent, requested: ChartType | None = None
+    ) -> AgentResponse:
+        await self._status(run, "planning", "Планирую визуализации")
+        allowed = set(self.config.chart_types or SUPPORTED_CHART_TYPES)
+        if requested in allowed:
+            allowed = {requested}
+        tables = select_tables(question, run.catalog, focus=run.state.focus_tables, max_tables=self.config.max_schema_tables)
+        plan = await plan_charts(
+            run.llm,
+            question,
+            run.catalog,
+            allowed_types=allowed,
+            tables=tables,
+            max_attempts=self.config.max_structured_attempts,
+            max_columns=self.config.max_schema_columns,
+        )
+        if requested in allowed:
+            plan.charts = plan.charts[:1]
+        blocks: list[Block] = []
+        summaries: list[str] = []
+        titles: list[str] = []
+        for item in plan.charts:
+            chart_question = (
+                f"{question}\n\n"
+                f"Собери данные для графика «{item.title}» ({item.chart_type.value}): "
+                f"{item.data_requirement}"
+            )
+            try:
+                execution = await self._execute(run, intent, chart_question)
+            except _EarlyReply as e:
+                run.trace.warnings.append(f"график «{item.title}» пропущен: {e.text}")
+                continue
+            if execution.result.status is not ToolStatus.OK:
+                continue
+            chart, note = choose_chart(
+                execution.result.table,
+                hint=execution.result.chart_hint,
+                requested=item.chart_type,
+                title=item.title,
+                allowed=self.config.chart_types,
+            )
+            if chart is None:
+                chart, note = choose_chart(
+                    execution.result.table,
+                    hint=execution.result.chart_hint,
+                    title=item.title,
+                    allowed=self.config.chart_types,
+                )
+                note = (note or "") + " (запрошенный тип недоступен для этих данных)"
+            artifact = self._store_artifact(
+                run, Intent.DATA_QUESTION, chart_question, execution, chart
+            )
+            blocks.append(TextBlock(markdown=f"**{item.title}**"))
+            blocks.extend(self._result_blocks(artifact, note))
+            if execution.result.summary_text:
+                summaries.append(execution.result.summary_text)
+            titles.append(item.title)
+
+        if not blocks:
+            raise _EarlyReply(
+                "clarification",
+                "Не удалось построить ни один график. Уточните, какие показатели нужны?",
+                self._examples(run.catalog),
+            )
+        turn.summary = " ".join(summaries)[:400] or "Готово."
+        turn.points = titles
+        return self._respond(run, "ok", blocks)
 
     async def _answer(self, run: _Run, decision: IntentDecision, turn: Turn) -> AgentResponse:
         question = decision.standalone_question
@@ -386,14 +500,12 @@ class Agent:
         widgets: list[DashboardWidget] = []
         skipped: list[str] = []
         for wp in plan.widgets:
-            intent = wp.intent if wp.intent in ANALYTIC_INTENTS else Intent.DATA_QUESTION
-            try:
-                ex = await self._execute(run, intent, wp.question)
-            except (_EarlyReply, StructuredOutputError) as e:
-                skipped.append(wp.title)
-                run.trace.warnings.append(f"виджет «{wp.title}» пропущен: {e}")
-                continue
-            if ex.result.status is not ToolStatus.OK or ex.result.table is None or not ex.result.table.rows:
+            intent = _widget_intent(wp.intent, wp.chart_type)
+            ex = await self._widget_execution(run, intent, wp.title, wp.question)
+            if ex is None and intent is not Intent.DATA_QUESTION:
+                intent = Intent.DATA_QUESTION
+                ex = await self._widget_execution(run, intent, wp.title, wp.question)
+            if ex is None:
                 skipped.append(wp.title)
                 continue
             chart, _ = choose_chart(
@@ -436,6 +548,17 @@ class Agent:
                 blocks.append(TableBlock(id=f"{dashboard.id}-{w.id}", title=w.title, data=w.data))  # type: ignore[arg-type]
         return self._respond(run, "ok", blocks)
 
+
+    async def _widget_execution(self, run: _Run, intent: Intent, title: str, question: str) -> _Execution | None:
+        try:
+            ex = await self._execute(run, intent, question)
+        except (_EarlyReply, StructuredOutputError) as e:
+            run.trace.warnings.append(f"виджет «{title}» ({intent.value}) не построен: {e}")
+            return None
+        if ex.result.status is not ToolStatus.OK or ex.result.table is None or not ex.result.table.rows:
+            run.trace.warnings.append(f"виджет «{title}» ({intent.value}) без данных")
+            return None
+        return ex
 
     async def _execute(self, run: _Run, intent: Intent, question: str) -> _Execution:
         tools = self.tools.for_intent(intent) or self.tools.for_intent(Intent.DATA_QUESTION)
@@ -494,12 +617,16 @@ class Agent:
             name=tool.name,
             description=tool.description,
             hint=tool.args_hint,
+            refs="; колонку указывай как «таблица.колонка»" if "column" in fields.values() else "",
             schema=render_schema(catalog, tables, max_columns=self.config.max_schema_columns),
         )
         content = ARGS_USER.format(question=question)
         if feedback is not None:
             content += ARGS_FEEDBACK.format(args=feedback[0].model_dump_json(), error=feedback[1])
         llm = run.sql_llm if tool.llm_role == "sql" else run.llm
+        def _preprocess(data: dict) -> dict:
+            data = fix_catalog_refs(data, fields, all_tables, all_columns)
+            return tool.preprocess_args(data, catalog)
         return await generate_structured(
             llm,
             [system_msg(prompt), user_msg(content)],
@@ -507,7 +634,7 @@ class Agent:
             schema=schema,
             schema_name=f"args_{tool.name}",
             max_attempts=self.config.max_structured_attempts,
-            preprocess=lambda data: fix_catalog_refs(data, fields, all_tables, all_columns),
+            preprocess=_preprocess,
             validate=lambda args: check_catalog_refs(args, fields, catalog),
         )
 
