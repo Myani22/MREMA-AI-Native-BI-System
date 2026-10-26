@@ -78,7 +78,7 @@ from .prompts import (
 )
 from .router import IntentDecision, IntentRouter
 from .schema_linking import render_schema, select_tables
-from .viz import alternative_chart, choose_chart
+from .viz import alternative_chart, candidates, choose_chart, mention_hint
 
 log = logging.getLogger(__name__)
 
@@ -542,10 +542,10 @@ class Agent:
             DashboardBlock(dashboard_id=dashboard.id, title=dashboard.title, widget_count=len(widgets)),
         ]
         for w in widgets:
+            chart_block = None
             if w.chart and w.chart.chart_type is not ChartType.TABLE:
-                blocks.append(self._chart_block(f"{dashboard.id}-{w.id}", w.chart, w.data, None))  # type: ignore[arg-type]
-            else:
-                blocks.append(TableBlock(id=f"{dashboard.id}-{w.id}", title=w.title, data=w.data))  # type: ignore[arg-type]
+                chart_block = self._chart_block(f"{dashboard.id}-{w.id}", w.chart, w.data, None)  # type: ignore[arg-type]
+            blocks.append(chart_block or TableBlock(id=f"{dashboard.id}-{w.id}", title=w.title, data=w.data))  # type: ignore[arg-type]
         return self._respond(run, "ok", blocks)
 
 
@@ -586,6 +586,7 @@ class Agent:
             )
         if result.status is ToolStatus.ERROR:
             raise _EarlyReply("error", result.error or GENERIC_ERROR_TEXT, retryable=True)
+        result.chart_hint = mention_hint(result.table, question, result.chart_hint)
         return _Execution(tool, args, result, self._tables_used(tool, args) or tables)
 
     async def _choose_tool(self, run: _Run, tools: list[BaseTool], question: str) -> BaseTool:
@@ -691,13 +692,31 @@ class Agent:
         run.state.add_artifact(artifact)
         return artifact
 
-    def _chart_block(self, block_id: str, spec: ChartSpec, data: ResultTable, note: str | None) -> ChartBlock:
-        engine_spec = None
-        if self.chart_exporter is not None:
-            try:
-                engine_spec = self.chart_exporter(spec, data)
-            except Exception:
-                log.exception("chart exporter failed for %s", spec.chart_type)
+    def _export(self, spec: ChartSpec, data: ResultTable) -> dict[str, Any] | None:
+        try:
+            return self.chart_exporter(spec, data) if self.chart_exporter is not None else None
+        except Exception:
+            log.exception("chart exporter failed for %s", spec.chart_type)
+            return None
+
+    def _chart_block(self, block_id: str, spec: ChartSpec, data: ResultTable, note: str | None) -> ChartBlock | None:
+        if self.chart_exporter is None:
+            return ChartBlock(id=block_id, spec=spec, data=data, note=note)
+        engine_spec = self._export(spec, data)
+        if engine_spec is None:
+            for alt in candidates(data, None, self.config.chart_types):
+                if alt.chart_type in (spec.chart_type, ChartType.TABLE):
+                    continue
+                alt = alt.model_copy(update={"title": spec.title})
+                engine_spec = self._export(alt, data)
+                if engine_spec is not None:
+                    reason = f"{CHART_LABELS[spec.chart_type].capitalize()} для этих данных не строится, показываю: {CHART_LABELS[alt.chart_type]}."
+                    note = f"{note} {reason}" if note else reason
+                    spec = alt
+                    break
+        if engine_spec is None:
+            log.info("no renderable chart for %s, showing table only", spec.chart_type)
+            return None
         return ChartBlock(id=block_id, spec=spec, data=data, note=note, engine_spec=engine_spec)
 
     def _result_blocks(self, artifact: Artifact, note: str | None) -> list[Block]:
@@ -706,9 +725,12 @@ class Agent:
             return []
         chart = artifact.chart
         blocks: list[Block] = []
+        chart_block = None
         if chart is not None and chart.chart_type is not ChartType.TABLE:
-            blocks.append(self._chart_block(f"{artifact.id}-chart", chart, table, note))
-        if chart is None or chart.chart_type is not ChartType.KPI:
+            chart_block = self._chart_block(f"{artifact.id}-chart", chart, table, note)
+        if chart_block is not None:
+            blocks.append(chart_block)
+        if chart_block is None or chart_block.spec.chart_type is not ChartType.KPI:
             blocks.append(TableBlock(id=f"{artifact.id}-table", title=chart.title if chart else "", data=table))
         return blocks
 

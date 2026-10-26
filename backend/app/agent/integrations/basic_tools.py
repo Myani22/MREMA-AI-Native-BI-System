@@ -69,7 +69,7 @@ class OverviewTool(BaseTool):
             ],
             rows=rows,
         )
-        return ToolResult(facts=facts, table=table, summary_text=summary, chart_hint=ChartHint(kind="comparison", x="Таблица", y=["Строк"]))
+        return ToolResult(facts=facts, table=table, summary_text=summary, chart_hint=ChartHint(kind="comparison", x="Таблица", y=["Строк"], preferred=ChartType.TABLE))
 
 
 class ColumnArgs(BaseModel):

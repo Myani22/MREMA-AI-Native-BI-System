@@ -18,7 +18,22 @@ SUPPORTED_CHART_TYPES: frozenset[ChartType] = frozenset(
 _engine = ChartEngine()
 
 
-def engine_schema(table: ResultTable) -> dict[str, str]:
+def engine_schema(table: ResultTable, engine_spec: dict[str, Any] | None = None) -> dict[str, str]:
+    schema = _raw_schema(table)
+    category_x = _category_x(engine_spec)
+    if category_x in schema:
+        schema[category_x] = "str"
+    return schema
+
+
+def _category_x(engine_spec: dict[str, Any] | None) -> str | None:
+    if not engine_spec or engine_spec.get("type") != "bar":
+        return None
+    x = engine_spec.get("x")
+    return x.get("name") if isinstance(x, dict) else None
+
+
+def _raw_schema(table: ResultTable) -> dict[str, str]:
     schema: dict[str, str] = {}
     for i, col in enumerate(table.columns):
         values = [r[i] for r in table.rows if r[i] is not None]
@@ -54,12 +69,14 @@ def to_engine_dict(spec: ChartSpec, table: ResultTable) -> dict[str, Any] | None
     title = spec.title or "График"
     match spec.chart_type:
         case ChartType.BAR if spec.x and spec.y:
+            x_column = table.column(spec.x)
+            by_time = x_column is not None and x_column.semantic_type in (SemanticType.DATE, SemanticType.DATETIME)
             return {
                 "type": "bar",
                 "title": title,
                 "x": _ref(spec.x, spec.x_label),
                 "y": _ref(spec.y[0], spec.y_label),
-                "sort": [{"by": "y", "dir": "desc"}],
+                "sort": [{"by": "x", "dir": "asc"}] if by_time else [{"by": "y", "dir": "desc"}],
                 "limit": max(1, min(rows, BAR_MAX_LIMIT)),
             }
         case ChartType.LINE if spec.x and spec.y:
@@ -94,7 +111,7 @@ def export_chart(spec: ChartSpec, table: ResultTable) -> dict[str, Any] | None:
     payload = to_engine_dict(spec, table)
     if payload is None:
         return None
-    validation = _engine.validate(_engine.from_dict(payload), engine_schema(table), row_count=len(table.rows))
+    validation = _engine.validate(_engine.from_dict(payload), engine_schema(table, payload), row_count=len(table.rows))
     if not validation.ok:
         log.info("chart spec rejected by chart engine: %s", [(e.reason, e.field) for e in validation.errors])
         return None
@@ -104,11 +121,17 @@ def export_chart(spec: ChartSpec, table: ResultTable) -> dict[str, Any] | None:
 def render_png(engine_spec: dict[str, Any], table: ResultTable) -> bytes:
     names = [c.name for c in table.columns]
     data = [dict(zip(names, row, strict=False)) for row in table.rows]
-    schema = engine_schema(table)
+    schema = engine_schema(table, engine_spec)
+    category_x = _category_x(engine_spec)
     for row in data:
         for name, kind in schema.items():
-            if kind == "date" and row[name] is not None and not isinstance(row[name], date):
-                row[name] = date.fromisoformat(str(row[name])[:10])
+            value = row.get(name)
+            if value is None:
+                continue
+            if kind == "date" and not isinstance(value, date):
+                row[name] = date.fromisoformat(str(value)[:10])
+            elif name == category_x and not isinstance(value, str):
+                row[name] = value.isoformat()[:10] if isinstance(value, date) else str(value)
     chart = _engine.from_dict(engine_spec)
     validation = _engine.validate(chart, schema, row_count=len(data))
     if not validation.ok:

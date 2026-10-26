@@ -23,6 +23,28 @@ def _label(c: TableColumn | None) -> str | None:
     return (c.label or c.name) if c else None
 
 
+def _position(column: TableColumn, text: str) -> int | None:
+    names = {column.name, column.label or column.name}
+    variants = {v.lower() for n in names for v in (n, n.replace("_", " "))}
+    found = [text.find(v) for v in variants if len(v) > 2 and v in text]
+    return min(found) if found else None
+
+
+def mention_hint(table: ResultTable | None, text: str, hint: ChartHint | None) -> ChartHint | None:
+    if table is None or not table.rows or (hint is not None and hint.y):
+        return hint
+    lowered = text.lower()
+    positions = [
+        (pos, c.name)
+        for c in table.columns
+        if c.semantic_type is SemanticType.NUMERIC and (pos := _position(c, lowered)) is not None
+    ]
+    if not positions:
+        return hint
+    y = [name for _, name in sorted(positions)]
+    return (hint or ChartHint()).model_copy(update={"y": y})
+
+
 def candidates(
     table: ResultTable, hint: ChartHint | None = None, allowed: Collection[ChartType] | None = None
 ) -> list[ChartSpec]:
@@ -30,9 +52,9 @@ def candidates(
     num = [c.name for c in table.columns if c.semantic_type is SemanticType.NUMERIC]
     time = [c.name for c in table.columns if c.semantic_type in TIME_TYPES]
     cat = [c.name for c in table.columns if c.semantic_type not in TIME_TYPES and c.semantic_type is not SemanticType.NUMERIC]
-    if hint:
-        hint_y = [y for y in hint.y if y in names]
-        num = hint_y + [n for n in num if n not in hint_y] if hint_y else num
+    hint_y = [y for y in hint.y if y in names] if hint else []
+    if hint_y:
+        num = hint_y + [n for n in num if n not in hint_y]
     rows = len(table.rows)
     if rows == 0:
         return []
@@ -60,8 +82,9 @@ def candidates(
             add(ChartType.PIE, x, num[:1])
         add(ChartType.LINE, x, num[:1])
     elif len(num) >= 2:
-        add(ChartType.SCATTER, num[0], [num[1]])
-        add(ChartType.LINE, num[0], [num[1]])
+        y_axis, x_axis = (num[0], num[1]) if hint_y else (num[1], num[0])
+        add(ChartType.SCATTER, x_axis, [y_axis])
+        add(ChartType.LINE, x_axis, [y_axis])
     elif len(num) == 1 and rows > 1:
         add(ChartType.HISTOGRAM, num[0], [])
     add(ChartType.TABLE, None, [])
