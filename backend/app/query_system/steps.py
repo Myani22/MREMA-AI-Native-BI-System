@@ -89,7 +89,7 @@ STEP_REGISTRY: dict[str, type[Step]] = {}
 
 VALID_SORT_DIRS: frozenset[str] = frozenset({"asc", "desc"})
 VALID_JOIN_TYPES: frozenset[str] = frozenset({"inner", "left", "right"})
-VALID_AGG_FUNCS: frozenset[str] = frozenset({"count", "sum", "avg", "min", "max"})
+VALID_AGG_FUNCS: frozenset[str] = frozenset({"count", "count_distinct", "sum", "avg", "min", "max"})
 
 
 def register_step(op_name: str) -> Callable[[type[Step]], type[Step]]:
@@ -978,6 +978,20 @@ class AggregateStep(Step):
                         )
                     elif agg.alias:
                         out_schema[agg.alias] = "int"
+                elif agg.func == "count_distinct":
+                    if agg.column not in in_schema:
+                        local_errors.append(
+                            ValidationError(
+                                step_index=step_index,
+                                var=self.var,
+                                reason="column_not_found",
+                                field=f"aggregates[{idx}].column",
+                                value=agg.column,
+                                valid_options=sorted(in_schema.keys()),
+                            )
+                        )
+                    elif agg.alias:
+                        out_schema[agg.alias] = "int"
                 else:
                     if agg.column not in in_schema:
                         local_errors.append(
@@ -1594,29 +1608,31 @@ def _build_join_schema(
     return out_schema
 
 
-def _compute_aggregate(
-    agg: AggregateSpec,
-    rows: Sequence[Mapping[str, Any]],
-) -> Any:
+def _compute_aggregate(agg: AggregateSpec, rows: list[dict[str, Any]]) -> Any:
     if agg.func == "count":
         if agg.column == "*":
             return len(rows)
         return sum(1 for r in rows if r.get(agg.column) is not None)
 
-    values = [
-        normalize_runtime_value(r[agg.column])
-        for r in rows
-        if r.get(agg.column) is not None
-    ]
-    if not values:
-        return None
+    if agg.func == "count_distinct":
+        return len(
+            {
+                normalize_runtime_value(r.get(agg.column))
+                for r in rows
+                if r.get(agg.column) is not None
+            }
+        )
+
+    vals = [r.get(agg.column) for r in rows if r.get(agg.column) is not None]
+    if not vals:
+        return 0 if agg.func == "sum" else None
 
     if agg.func == "sum":
-        return sum(values)
+        return sum(vals)
     if agg.func == "avg":
-        return float(sum(values)) / len(values)
+        return sum(vals) / len(vals)
     if agg.func == "min":
-        return min(values)
+        return min(vals, key=normalize_runtime_value)
     if agg.func == "max":
-        return max(values)
+        return max(vals, key=normalize_runtime_value)
     raise ValueError(f"Unsupported aggregate function: {agg.func}")

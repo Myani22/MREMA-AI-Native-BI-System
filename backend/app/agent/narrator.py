@@ -4,18 +4,27 @@ import json
 import logging
 import math
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
 from .contracts.tools import ToolResult
 from .llm.client import LLMClient, assistant_msg, system_msg, user_msg
 from .llm.structured import generate_structured
-from .prompts import GROUNDING_FEEDBACK, NARRATOR_SYSTEM, NARRATOR_USER
+from .prompts import (
+    DASHBOARD_NARRATOR_SYSTEM,
+    GROUNDING_FEEDBACK,
+    NARRATOR_FOCUS,
+    NARRATOR_SYSTEM,
+    NARRATOR_USER,
+)
+
+if TYPE_CHECKING:
+    from .memory import ChartMicrosession
 
 log = logging.getLogger(__name__)
 
-_NUMBER_RE = re.compile(r"(?<![\w.,])-?\d{1,3}(?:[   ]\d{3})+(?:[.,]\d+)?(?![\w])|(?<![\w.,])-?\d+(?:[.,]\d+)?")
+_NUMBER_RE = re.compile(r"(?<![\w.,])-?\d{1,3}(?:[   ]\d{3})+(?:[.,]\d+)?(?![\w])|(?<![\w.,])-?\d+(?:[.,]\d+)?")
 _SMALL_INT_LIMIT = 12
 _SCALES = (1.0, 100.0, 1e-3, 1e-6, 1e-9)
 
@@ -27,7 +36,7 @@ class Narrative(BaseModel):
 
 
 def _parse_number(token: str) -> tuple[float, int] | None:
-    clean = re.sub(r"[   ]", "", token).replace(",", ".")
+    clean = re.sub(r"[   ]", "", token).replace(",", ".")
     try:
         value = float(clean)
     except ValueError:
@@ -96,13 +105,17 @@ async def narrate(
     question: str,
     result: ToolResult,
     *,
+    focus: str | None = None,
     preview_rows: int = 20,
     max_chars: int = 6000,
-    max_attempts: int = 3,
+    max_attempts: int = 2,
 ) -> tuple[Narrative, list[str]]:
     payload = build_payload(result, preview_rows, max_chars)
     payload_text = json.dumps(payload, ensure_ascii=False, default=str)
-    messages = [system_msg(NARRATOR_SYSTEM), user_msg(NARRATOR_USER.format(question=question, payload=payload_text))]
+    user_content = NARRATOR_USER.format(question=question, payload=payload_text)
+    if focus:
+        user_content += NARRATOR_FOCUS.format(focus=focus)
+    messages = [system_msg(NARRATOR_SYSTEM), user_msg(user_content)]
     warnings: list[str] = []
     for attempt in range(2):
         narrative = await generate_structured(
@@ -124,3 +137,30 @@ async def narrate(
     if ungrounded_numbers(narrative.summary, payload):
         return _fallback(result), warnings
     return Narrative(summary=narrative.summary), warnings
+
+
+async def narrate_dashboard(
+    llm: LLMClient,
+    question: str,
+    charts: list[ChartMicrosession],
+    *,
+    max_attempts: int = 2,
+) -> Narrative:
+    digest = [
+        {
+            "title": c.chart_spec.title or c.question,
+            "summary": c.summary,
+            "points": c.points,
+            "rows_preview": c.table.rows[:5],
+        }
+        for c in charts
+    ]
+    user_text = f"Запрос: {question}\nГрафики:\n{json.dumps(digest, ensure_ascii=False, default=str)}"
+    return await generate_structured(
+        llm,
+        [system_msg(DASHBOARD_NARRATOR_SYSTEM), user_msg(user_text)],
+        Narrative,
+        schema_name="dashboard_narrative",
+        max_attempts=max_attempts,
+        temperature=0.2,
+    )

@@ -51,10 +51,9 @@ class SortKeyArg(BaseModel):
 
 
 class AggregateArg(BaseModel):
-    func: Literal["count", "sum", "avg", "min", "max"]
+    func: Literal["count", "count_distinct", "sum", "avg", "min", "max"]
     column: str = Field(description="Колонка или '*' для count")
     alias: str = Field(description="Имя колонки результата, по-русски, например «Выручка»")
-
 
 class JoinKeyArg(BaseModel):
     left_col: str
@@ -219,9 +218,7 @@ def to_result_table(rows: list[dict[str, Any]], schema: dict[str, str], max_rows
 class QueryDslTool(BaseTool):
     name = "data_query"
     description = "Отвечает на вопрос расчётом по данным: фильтры, группировки, суммы, средние, рейтинги, соединения таблиц."
-    intents = frozenset(
-        {Intent.DATA_QUESTION, Intent.SEGMENT_COMPARE, Intent.TIME_PATTERNS, Intent.ANOMALIES, Intent.CORRELATION}
-    )
+    intents = frozenset({Intent.CHART, Intent.EDIT_CHART})
     args_model = QueryArgs
     args_hint = _steps_hint()
     llm_role = "sql"

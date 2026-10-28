@@ -37,9 +37,8 @@ DEFAULT_GIGACHAT_SCOPE = "GIGACHAT_API_PERS"
 DEFAULT_GIGACHAT_AUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 DEFAULT_GIGACHAT_API_URL = "https://gigachat.devices.sberbank.ru/api/v1"
 
-DEFAULT_MAX_STRUCTURED_ATTEMPTS = 3
+DEFAULT_MAX_STRUCTURED_ATTEMPTS = 2
 DEFAULT_MAX_TOOL_REPAIRS = 2
-DEFAULT_CLARIFY_THRESHOLD = 0.45
 DEFAULT_HISTORY_TURNS = 4
 DEFAULT_MAX_SCHEMA_TABLES = 3
 DEFAULT_MAX_SCHEMA_COLUMNS = 60
@@ -47,6 +46,11 @@ DEFAULT_TOOL_TIMEOUT_S = 60.0
 DEFAULT_PREVIEW_ROWS = 20
 DEFAULT_STORED_ROWS = 500
 DEFAULT_MAX_NARRATIVE_PAYLOAD_CHARS = 6000
+DEFAULT_MAX_CHARTS = 3
+DEFAULT_MAX_DASHBOARD_WIDGETS = 5
+DEFAULT_GLOBAL_ERROR_BUDGET = 8
+DEFAULT_PER_STEP_ERROR_BUDGET = 2
+DEFAULT_MAX_MICROSESSIONS = 5
 
 _TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
 
@@ -286,7 +290,6 @@ class AgentConfig:
     sql_llm: BaseLLMConfig | None = None
     max_structured_attempts: int = DEFAULT_MAX_STRUCTURED_ATTEMPTS
     max_tool_repairs: int = DEFAULT_MAX_TOOL_REPAIRS
-    clarify_threshold: float = DEFAULT_CLARIFY_THRESHOLD
     history_turns: int = DEFAULT_HISTORY_TURNS
     max_schema_tables: int = DEFAULT_MAX_SCHEMA_TABLES
     max_schema_columns: int = DEFAULT_MAX_SCHEMA_COLUMNS
@@ -294,6 +297,11 @@ class AgentConfig:
     preview_rows: int = DEFAULT_PREVIEW_ROWS
     stored_rows: int = DEFAULT_STORED_ROWS
     max_narrative_payload_chars: int = DEFAULT_MAX_NARRATIVE_PAYLOAD_CHARS
+    max_charts: int = DEFAULT_MAX_CHARTS
+    max_dashboard_widgets: int = DEFAULT_MAX_DASHBOARD_WIDGETS
+    global_error_budget: int = DEFAULT_GLOBAL_ERROR_BUDGET
+    per_step_error_budget: int = DEFAULT_PER_STEP_ERROR_BUDGET
+    max_microsessions: int = DEFAULT_MAX_MICROSESSIONS
     chart_types: frozenset[Any] | None = None
 
     @classmethod

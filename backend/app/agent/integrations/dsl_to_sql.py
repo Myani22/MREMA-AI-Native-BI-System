@@ -77,7 +77,11 @@ def _cond(c: Condition) -> str:
     raise DslCompileError(f"неизвестное условие {type(c).__name__}")
 
 
-def _agg(a) -> str:
+def _agg(a: Any) -> str:
+    if a.func == "count_distinct":
+        if a.column == "*":
+            return f"COUNT(*) AS {_q(a.alias)}"
+        return f"COUNT(DISTINCT {_q(a.column)}) AS {_q(a.alias)}"
     if a.column == "*":
         return f"COUNT(*) AS {_q(a.alias)}"
     return f"{a.func.upper()}({_q(a.column)}) AS {_q(a.alias)}"

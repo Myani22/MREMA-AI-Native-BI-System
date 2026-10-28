@@ -24,7 +24,7 @@ from app.agent.contracts import (
 from app.agent.contracts.tools import ChartHint
 from app.agent.intents import Intent
 from app.agent.llm.client import ChatMessage, LLMReply
-from app.agent.prompts import SQL_GUIDE
+#from app.agent.prompts import SQL_GUIDE
 
 Reply = str | dict[str, Any] | Callable[[Sequence[ChatMessage]], str]
 

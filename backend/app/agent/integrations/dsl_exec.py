@@ -18,6 +18,15 @@ DSL_TYPES = frozenset({"int", "float", "str", "date", "bool"})
 MIXED_SOURCES_TEXT = "Нельзя в одном запросе соединять таблицы, загруженные в память, и таблицы из базы данных."
 DB_UNAVAILABLE_TEXT = "Таблицы из базы данных сейчас недоступны."
 
+AGG_OUTPUT_TYPES: dict[str, str | None] = {
+    "count": "int",
+    "count_distinct": "int",
+    "avg": "float",
+    "sum": None,
+    "min": None,
+    "max": None,
+}
+
 
 class DslRunError(Exception):
     def __init__(self, status: ToolStatus, message: str):

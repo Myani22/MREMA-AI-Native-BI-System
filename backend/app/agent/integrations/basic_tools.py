@@ -34,7 +34,7 @@ class NoArgs(BaseModel):
 class OverviewTool(BaseTool):
     name = "dataset_overview"
     description = "Обзор всех загруженных таблиц: объём, период, состав и типы колонок, связи."
-    intents = frozenset({Intent.DATASET_OVERVIEW})
+    intents = frozenset({Intent.OVERVIEW})
     args_model = NoArgs
 
     async def run(self, args: BaseModel, ctx: ToolContext) -> ToolResult:
@@ -105,7 +105,7 @@ def _column_facts(catalog: Catalog, ref: str) -> dict[str, Any] | None:
 class DescribeColumnTool(BaseTool):
     name = "describe_column"
     description = "Описывает одно поле: тип, число разных значений, пропуски, диапазон, частые значения."
-    intents = frozenset({Intent.DESCRIBE_COLUMN})
+    intents = frozenset()
     args_model = ColumnArgs
 
     async def run(self, args: ColumnArgs, ctx: ToolContext) -> ToolResult:
@@ -127,7 +127,7 @@ class TopValuesArgs(BaseModel):
 class TopValuesTool(BaseTool):
     name = "top_values"
     description = "Частые значения одной колонки с количеством и долей; для числовых и дат — распределение по значениям."
-    intents = frozenset({Intent.DISTRIBUTION})
+    intents = frozenset()
     args_model = TopValuesArgs
 
     def __init__(self, schema: Callable[[], dict[str, dict[str, str]]], sources: Callable[[], dict[str, Any]]):
@@ -192,7 +192,7 @@ class RelationsArgs(BaseModel):
 class RelationsTool(BaseTool):
     name = "relationships"
     description = "Показывает, как таблицы и записи связаны через общие идентификаторы."
-    intents = frozenset({Intent.RELATIONSHIPS})
+    intents = frozenset()
     args_model = RelationsArgs
 
     async def run(self, args: RelationsArgs, ctx: ToolContext) -> ToolResult:

@@ -13,23 +13,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from .catalog_refs import (
-    build_args_schema,
-    catalog_fields,
-    check_catalog_refs,
-    fix_catalog_refs,
-)
-from .chart_planner import plan_charts
 from .config import AgentConfig
-from .contracts.catalog import (
-    TIME_TYPES,
-    Catalog,
-    CatalogProvider,
-    QueryError,
-    QueryExecutor,
-    SemanticType,
-    split_column_ref,
-)
+from .contracts.catalog import TIME_TYPES, Catalog, CatalogProvider, QueryExecutor, SemanticType
 from .contracts.dashboard import Dashboard, DashboardStore, DashboardWidget
 from .contracts.response import (
     CHART_LABELS,
@@ -51,55 +36,54 @@ from .contracts.response import (
     TextBlock,
     ToolCallTrace,
 )
-from .contracts.tools import BaseTool, ToolContext, ToolRegistry, ToolResult, ToolStatus
+from .contracts.tools import ToolContext, ToolRegistry, ToolResult, ToolStatus
+from .dsl_builder import build_dsl
+from .error_budget import ErrorBudget
+from .integrations.basic_tools import NoArgs, OverviewTool
 from .integrations.charts import SUPPORTED_CHART_TYPES
-from .intents import ANALYTIC_INTENTS, Intent
+from .integrations.dsl_exec import DslRunError, DslRunner
+from .integrations.query_dsl import QueryArgs, QueryDslTool, to_result_table
+from .intents import Intent
 from .llm.client import ChatMessage, LLMClient, LLMReply, system_msg, user_msg
 from .llm.errors import LLMError, LLMUnavailableError, StructuredOutputError
-from .llm.structured import generate_structured, model_schema
-from .memory import Artifact, InMemoryMemoryStore, MemoryStore, SessionState, Turn
-from .narrator import narrate
+from .llm.structured import generate_structured
+from .memory import (
+    ChartMicrosession,
+    DashboardMicrosession,
+    InMemoryMemoryStore,
+    MemoryStore,
+    SessionState,
+    Turn,
+)
+from .narrator import narrate, narrate_dashboard
+from .planner import ChartPlan, ChartPlanItem, plan_charts
 from .prompts import (
-    ARGS_FEEDBACK,
-    ARGS_SYSTEM,
-    ARGS_USER,
     CLARIFY_DEFAULT,
-    DASHBOARD_SYSTEM,
-    EMPTY_RESULT_TEXT,
+    EXPLAIN_FAILURE_SYSTEM,
     GENERIC_ERROR_TEXT,
     HELP_TEXT,
     LLM_DOWN_TEXT,
     NO_DATA_TEXT,
-    NOT_IMPLEMENTED_TEXT,
     NOT_UNDERSTOOD_TEXT,
     OUT_OF_SCOPE_TEXT,
-    TOOL_CHOICE_SYSTEM,
-    TOOL_TIMEOUT_TEXT,
 )
 from .router import IntentDecision, IntentRouter
-from .schema_linking import render_schema, select_tables
-from .viz import alternative_chart, candidates, choose_chart, mention_hint
+from .schema_linking import select_tables
+from .viz import alternative_chart, candidates, choose_chart
 
 log = logging.getLogger(__name__)
 
 EventSink = Callable[[StreamEvent], Awaitable[None]]
 ResponseStatus = Literal["ok", "clarification", "refused", "error"]
 
-
-class ToolChoice(BaseModel):
-    tool: str
-
-
-class WidgetPlan(BaseModel):
-    title: str
-    question: str
-    intent: Intent
-    chart_type: ChartType | None = None
+_DASHBOARD_HINT_RE = re.compile(
+    r"дашборд|панел[ьиейя]|dashboard|нескольк\w*\s+(график|диаграмм|виджет)", re.I
+)
 
 
-class DashboardPlan(BaseModel):
-    title: str
-    widgets: list[WidgetPlan] = Field(min_length=1, max_length=6)
+class FailureExplanation(BaseModel):
+    message: str
+    options: list[str] = Field(default_factory=list, max_length=4)
 
 
 class _EarlyReply(Exception):
@@ -141,42 +125,12 @@ class _Run:
     catalog: Catalog = field(default_factory=Catalog)
 
 
-@dataclass
-class _Execution:
-    tool: BaseTool
-    args: BaseModel
-    result: ToolResult
-    tables: list[str]
-
-
 def _new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
-def _title(question: str, limit: int = 90) -> str:
-    q = question.strip().rstrip("?").strip()
-    return q if len(q) <= limit else q[: limit - 1].rstrip() + "…"
-
-
-_MULTI_RE = re.compile(
-    r"сравн|обзор|несколько|дашборд|панел|отчёт|отчет|покажи\s+всё|покажи\s+все",
-    re.I,
-)
-
-
-def _looks_multi_chart(text: str) -> bool:
-    return bool(_MULTI_RE.search(text))
-
-
-_TWO_AXIS_CHARTS = frozenset({ChartType.LINE, ChartType.SCATTER, ChartType.AREA})
-
-
-def _widget_intent(intent: Intent, chart_type: ChartType | None) -> Intent:
-    if intent not in ANALYTIC_INTENTS:
-        return Intent.DATA_QUESTION
-    if intent is Intent.DISTRIBUTION and chart_type in _TWO_AXIS_CHARTS:
-        return Intent.DATA_QUESTION
-    return intent
+def _now() -> datetime:
+    return datetime.now(UTC)
 
 
 class Agent:
@@ -186,7 +140,7 @@ class Agent:
         llm: LLMClient,
         catalog_provider: CatalogProvider,
         executor: QueryExecutor | None = None,
-        tools: ToolRegistry,
+        tools: ToolRegistry | None = None,
         memory: MemoryStore | None = None,
         dashboards: DashboardStore | None = None,
         config: AgentConfig | None = None,
@@ -197,12 +151,18 @@ class Agent:
         self.sql_llm = sql_llm or llm
         self.catalog_provider = catalog_provider
         self.executor = executor
-        self.tools = tools
+        self.tools = tools or ToolRegistry([OverviewTool()])
         self.memory = memory or InMemoryMemoryStore()
         self.dashboards = dashboards
         self.config = config or AgentConfig()
         self.chart_exporter = chart_exporter
         self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+    def _get_runner(self) -> DslRunner:
+        dsl_tool = self.tools.get("data_query")
+        if isinstance(dsl_tool, QueryDslTool):
+            return dsl_tool.runner
+        return DslRunner(lambda: {}, lambda: {})
 
     async def handle(self, session_id: str, message: str, *, emit: EventSink | None = None) -> AgentResponse:
         async with self._locks[session_id]:
@@ -215,23 +175,21 @@ class Agent:
         if dashboard is None:
             return None
         catalog = await self.catalog_provider.get_catalog()
+        runner = self._get_runner()
         for widget in dashboard.widgets:
-            tool = self.tools.get(widget.tool)
-            if tool is None:
-                continue
             ctx = ToolContext(catalog, self.executor, dashboard.session_id, widget.question, self.llm)
             try:
-                result = await asyncio.wait_for(
-                    tool.run(tool.args_model.model_validate(widget.args), ctx), self.config.tool_timeout_s
+                args = QueryArgs.model_validate(widget.args)
+                outcome = await asyncio.wait_for(
+                    runner.run(args, ctx, max_rows=self.config.stored_rows),
+                    self.config.tool_timeout_s,
                 )
             except Exception as e:
-                log.exception("dashboard %s widget %s refresh failed", dashboard_id, widget.id)
                 log.warning("виджет «%s» не обновлен: %s", widget.title, e)
                 continue
-            if result.status is ToolStatus.OK and result.table is not None:
-                widget.data = result.table.head(self.config.stored_rows)
-                widget.summary = result.summary_text or widget.summary
-        dashboard.refreshed_at = datetime.now(UTC)
+            if outcome.rows:
+                widget.data = to_result_table(outcome.rows, outcome.schema, self.config.stored_rows)
+        dashboard.refreshed_at = _now()
         await self.dashboards.save(dashboard)
         return dashboard
 
@@ -286,10 +244,13 @@ class Agent:
     async def _dispatch(self, run: _Run, message: str, turn: Turn) -> AgentResponse:
         await self._status(run, "routing", "Разбираю вопрос")
         run.catalog = await self.catalog_provider.get_catalog()
-        router = IntentRouter(run.llm, history_turns=self.config.history_turns, max_attempts=self.config.max_structured_attempts)
+        router = IntentRouter(
+            run.llm,
+            history_turns=self.config.history_turns,
+            max_attempts=self.config.max_structured_attempts,
+        )
         decision, routed_by = await router.route(message, run.state, run.catalog)
         run.trace.intent = decision.intent
-        run.trace.confidence = decision.confidence
         run.trace.standalone_question = decision.standalone_question
         run.trace.routed_by = routed_by  # type: ignore[assignment]
         turn.intent = decision.intent
@@ -297,402 +258,438 @@ class Agent:
         examples = self._examples(run.catalog)
 
         match decision.intent:
-            case Intent.HELP:
+            case Intent.META_HELP:
                 return self._respond(run, "ok", [TextBlock(markdown=HELP_TEXT)], examples)
-            case Intent.OUT_OF_SCOPE:
+            case Intent.META_REFUSE:
                 return self._respond(run, "refused", [TextBlock(markdown=OUT_OF_SCOPE_TEXT)], examples)
-            case Intent.UNCLEAR:
+            case Intent.META_UNCLEAR:
                 return self._clarify(run, decision.clarification_question or CLARIFY_DEFAULT, examples)
-        if decision.confidence < self.config.clarify_threshold:
-            question = decision.clarification_question or f"Правильно понимаю, что нужно: «{decision.standalone_question}»?"
-            return self._clarify(run, question, [decision.standalone_question, *examples][:4])
-        if not run.catalog.tables:
+
+        if not run.catalog.tables and decision.intent is not Intent.FOLLOW_UP:
             return self._respond(run, "ok", [TextBlock(markdown=NO_DATA_TEXT)])
 
         match decision.intent:
-            case Intent.CHANGE_VIEW:
-                return await self._change_view(run, decision, turn)
-            case Intent.FOLLOW_UP_DETAIL:
-                return await self._follow_up(run, decision, turn, router)
-            case Intent.CREATE_DASHBOARD:
-                return await self._dashboard(run, decision, turn, message)
-            case _ if decision.intent in {
-                Intent.DATA_QUESTION,
-                Intent.TIME_PATTERNS,
-                Intent.SEGMENT_COMPARE,
-                Intent.CORRELATION,
-            } and (
-                decision.wants_chart or _looks_multi_chart(decision.standalone_question)
-            ):
-                return await self._answer_chart_first(
-                    run, decision.standalone_question, turn, decision.intent, decision.chart_type
-                )
+            case Intent.OVERVIEW:
+                return await self._overview_pipeline(run, decision, turn)
+            case Intent.FOLLOW_UP:
+                return await self._follow_up(run, decision, turn)
+            case Intent.EDIT_CHART:
+                edit_ctx = self._resolve_edit_context(run, decision)
+                return await self._chart_pipeline(run, decision, turn, edit_context=edit_ctx)
+            case Intent.CHART:
+                return await self._chart_pipeline(run, decision, turn)
             case _:
-                return await self._answer(run, decision, turn)
+                return self._clarify(run, CLARIFY_DEFAULT, examples)
 
-    async def _answer_chart_first(
-        self, run: _Run, question: str, turn: Turn, intent: Intent, requested: ChartType | None = None
+    def _resolve_edit_context(self, run: _Run, decision: IntentDecision) -> dict[str, Any]:
+        target = run.state.get_microsession(decision.target_microsession_id)
+        if target is None:
+            raise _EarlyReply(
+                "clarification",
+                "Пока нечего перерисовать: сначала задайте вопрос к данным.",
+                self._examples(run.catalog),
+            )
+        if isinstance(target, DashboardMicrosession):
+            if not target.charts:
+                raise _EarlyReply(
+                    "clarification",
+                    "В последнем дашборде нет графиков для редактирования.",
+                    self._examples(run.catalog),
+                )
+            chart_micro = target.charts[-1]
+        else:
+            chart_micro = target
+        return {
+            "microsession": chart_micro,
+            "original_question": chart_micro.question,
+            "original_chart_type": chart_micro.chart_type.value,
+            "original_dsl": chart_micro.chart_args,
+            "view_only": run.trace.routed_by == "rules" or decision.chart_type is not None,
+        }
+
+    async def _overview_pipeline(self, run: _Run, decision: IntentDecision, turn: Turn) -> AgentResponse:
+        await self._status(run, "running_tool", "Изучаю структуру данных")
+        tool = self.tools.get("dataset_overview") or OverviewTool()
+        ctx = ToolContext(run.catalog, self.executor, run.session_id, decision.standalone_question, run.llm)
+        started = time.monotonic()
+        result = await tool.run(NoArgs(), ctx)
+        run.trace.tool_calls.append(
+            ToolCallTrace(
+                tool=tool.name,
+                args={},
+                status=result.status.value,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+            )
+        )
+        await self._status(run, "writing", "Формулирую обзор")
+        narrative, warnings = await narrate(
+            run.llm,
+            decision.standalone_question,
+            result,
+            preview_rows=self.config.preview_rows,
+            max_chars=self.config.max_narrative_payload_chars,
+            max_attempts=self.config.per_step_error_budget,
+        )
+        run.trace.warnings.extend(warnings)
+        turn.summary = narrative.summary
+        turn.points = narrative.points
+        blocks: list[Block] = [TextBlock(markdown=narrative.summary, points=narrative.points)]
+        if result.table is not None and result.table.rows:
+            blocks.append(TableBlock(id=f"{run.turn_id}-overview", title="Таблицы", data=result.table))
+        return self._respond(run, "ok", blocks, narrative.follow_ups)
+
+    async def _chart_pipeline(
+        self,
+        run: _Run,
+        decision: IntentDecision,
+        turn: Turn,
+        *,
+        edit_context: dict[str, Any] | None = None,
     ) -> AgentResponse:
-        await self._status(run, "planning", "Планирую визуализации")
+        question = decision.standalone_question
+        budget = ErrorBudget(
+            global_left=self.config.global_error_budget,
+            per_step=self.config.per_step_error_budget,
+        )
         allowed = set(self.config.chart_types or SUPPORTED_CHART_TYPES)
-        if requested in allowed:
-            allowed = {requested}
-        tables = select_tables(question, run.catalog, focus=run.state.focus_tables, max_tables=self.config.max_schema_tables)
+
+        # Быстрый путь EDIT_CHART: меняем только отображение без регенерации DSL
+        if edit_context and edit_context.get("view_only"):
+            orig: ChartMicrosession = edit_context["microsession"]
+            title = orig.chart_spec.title or orig.question
+            if decision.chart_type is not None:
+                spec, note = choose_chart(
+                    orig.table,
+                    requested=decision.chart_type,
+                    title=title,
+                    allowed=allowed,
+                )
+            else:
+                alt = alternative_chart(orig.table, orig.chart_type, None, allowed)
+                spec = alt.model_copy(update={"title": title}) if alt else None
+                note = None
+            if spec is None:
+                raise _EarlyReply(
+                    "clarification",
+                    "Эти данные не получается показать иначе. Какой вид графика нужен?",
+                    self._examples(run.catalog),
+                )
+            new_micro = ChartMicrosession(
+                id=_new_id(),
+                question=orig.question,
+                chart_type=spec.chart_type,
+                chart_spec=spec,
+                chart_args=dict(orig.chart_args),
+                table=orig.table,
+                note=note,
+                summary=f"Те же данные, вид: {CHART_LABELS[spec.chart_type]}.",
+                points=list(orig.points),
+                created_at=_now(),
+            )
+            run.state.add_microsession(new_micro, max_items=self.config.max_microsessions)
+            turn.microsession_id = new_micro.id
+            turn.summary = new_micro.summary
+            turn.points = new_micro.points
+            blocks: list[Block] = [
+                TextBlock(markdown=new_micro.summary, points=new_micro.points),
+                *self._micro_blocks(new_micro),
+            ]
+            return self._respond(run, "ok", blocks)
+
+        await self._status(run, "planning", "Планирую графики")
+        tables = select_tables(
+            question,
+            run.catalog,
+            focus=run.state.focus_tables,
+            max_tables=self.config.max_schema_tables,
+        )
+        is_dashboard_req = bool(_DASHBOARD_HINT_RE.search(question))
+        max_items = (
+            self.config.max_dashboard_widgets if is_dashboard_req else self.config.max_charts
+        )
         plan = await plan_charts(
             run.llm,
             question,
             run.catalog,
-            allowed_types=allowed,
             tables=tables,
-            max_attempts=self.config.max_structured_attempts,
+            max_items=max_items,
+            allowed=allowed,
+            edit_context=edit_context,
+            max_attempts=self.config.per_step_error_budget,
             max_columns=self.config.max_schema_columns,
         )
-        if requested in allowed:
-            plan.charts = plan.charts[:1]
-        blocks: list[Block] = []
-        summaries: list[str] = []
-        titles: list[str] = []
-        for item in plan.charts:
-            chart_question = (
-                f"{question}\n\n"
-                f"Собери данные для графика «{item.title}» ({item.chart_type.value}): "
-                f"{item.data_requirement}"
-            )
+
+        runner = self._get_runner()
+        charts: list[ChartMicrosession] = []
+        skipped: list[tuple[str, str]] = []
+
+        for item in plan.items:
+            if budget.exhausted:
+                skipped.append((item.title, "исчерпан бюджет ошибок"))
+                continue
+
+            if edit_context and item.reuse_original_dsl and edit_context.get("original_dsl"):
+                args = QueryArgs.model_validate(edit_context["original_dsl"])
+                dsl_warnings: list[str] = []
+            else:
+                await self._status(run, "planning", f"Собираю запрос: {item.title}")
+                args, dsl_warnings = await build_dsl(
+                    run.sql_llm,
+                    question=question,
+                    chart_type=item.chart_type,
+                    title=item.title,
+                    purpose=item.purpose,
+                    catalog=run.catalog,
+                    tables=tables,
+                    budget=budget,
+                    max_attempts_per_step=self.config.per_step_error_budget,
+                )
+                run.trace.warnings.extend(dsl_warnings)
+
+            if args is None:
+                reason = dsl_warnings[-1] if dsl_warnings else "не удалось построить DSL"
+                skipped.append((item.title, reason))
+                continue
+
+            await self._status(run, "running_tool", f"Считаю: {item.title}")
+            ctx = ToolContext(run.catalog, self.executor, run.session_id, item.purpose, run.llm)
+            started_exec = time.monotonic()
             try:
-                execution = await self._execute(run, intent, chart_question)
-            except (LLMError, StructuredOutputError, _EarlyReply) as e:
-                run.trace.warnings.append(f"график «{item.title}» ({item.chart_type.value}) пропущен: {e}")
+                outcome = await asyncio.wait_for(
+                    runner.run(args, ctx, max_rows=self.config.stored_rows),
+                    self.config.tool_timeout_s,
+                )
+                run.trace.tool_calls.append(
+                    ToolCallTrace(
+                        tool="data_query",
+                        args=args.to_engine(),
+                        status="ok" if outcome.rows else "empty",
+                        elapsed_ms=int((time.monotonic() - started_exec) * 1000),
+                        sql=outcome.sql,
+                    )
+                )
+            except (DslRunError, TimeoutError) as e:
+                err_text = e.message if isinstance(e, DslRunError) else "превышено время ожидания"
+                run.trace.tool_calls.append(
+                    ToolCallTrace(
+                        tool="data_query",
+                        args=args.to_engine(),
+                        status="error",
+                        elapsed_ms=int((time.monotonic() - started_exec) * 1000),
+                        error=err_text,
+                    )
+                )
+                skipped.append((item.title, err_text))
                 continue
-            if execution.result.status is not ToolStatus.OK:
+
+            if not outcome.rows:
+                skipped.append((item.title, "нет данных"))
                 continue
-            chart, note = choose_chart(
-                execution.result.table,
-                hint=execution.result.chart_hint,
+
+            table = to_result_table(outcome.rows, outcome.schema, self.config.stored_rows)
+            spec, note = choose_chart(
+                table,
                 requested=item.chart_type,
                 title=item.title,
-                allowed=self.config.chart_types,
+                allowed=allowed,
             )
-            if chart is None:
-                chart, note = choose_chart(
-                    execution.result.table,
-                    hint=execution.result.chart_hint,
-                    title=item.title,
-                    allowed=self.config.chart_types,
+            if spec is None:
+                spec = ChartSpec(chart_type=ChartType.TABLE, title=item.title)
+            charts.append(
+                ChartMicrosession(
+                    id=_new_id(),
+                    question=item.purpose or question,
+                    chart_type=spec.chart_type,
+                    chart_spec=spec,
+                    chart_args=args.to_engine(),
+                    table=table,
+                    note=note,
+                    summary="",
+                    points=[],
+                    created_at=_now(),
                 )
-                note = (note or "") + " (запрошенный тип недоступен для этих данных)"
-            artifact = self._store_artifact(
-                run, Intent.DATA_QUESTION, chart_question, execution, chart
             )
-            blocks.append(TextBlock(markdown=f"**{item.title}**"))
-            blocks.extend(self._result_blocks(artifact, note))
-            if execution.result.summary_text:
-                summaries.append(execution.result.summary_text)
-            titles.append(item.title)
 
-        if not blocks:
+        run.state.set_focus(tables)
+
+        if not charts:
+            msg, opts = await self._explain_failure(run, question, skipped)
+            raise _EarlyReply("clarification", msg, opts)
+
+        dashboard_narrative = None
+        follow_ups: list[str] = []
+        if decision.wants_explanation:
+            await self._status(run, "writing", "Формулирую выводы")
+            for c in charts:
+                if budget.exhausted:
+                    break
+                try:
+                    narrative, nar_warnings = await narrate(
+                        run.llm,
+                        c.question,
+                        ToolResult(table=c.table),
+                        preview_rows=self.config.preview_rows,
+                        max_chars=self.config.max_narrative_payload_chars,
+                        max_attempts=self.config.per_step_error_budget,
+                    )
+                    run.trace.warnings.extend(nar_warnings)
+                    c.summary = narrative.summary
+                    c.points = narrative.points
+                    if not follow_ups:
+                        follow_ups = narrative.follow_ups
+                except StructuredOutputError:
+                    budget.consume(f"narrate:{c.id}")
+            if len(charts) > 1 and not budget.exhausted:
+                try:
+                    dashboard_narrative = await narrate_dashboard(
+                        run.llm, question, charts, max_attempts=self.config.per_step_error_budget
+                    )
+                except StructuredOutputError:
+                    pass
+
+        # Сохранение микросессии (и DashboardStore для мульти-графиков)
+        if len(charts) == 1:
+            micro: ChartMicrosession | DashboardMicrosession = charts[0]
+            turn.summary = micro.summary or f"Построен график «{micro.chart_spec.title}»."
+            turn.points = micro.points or [micro.chart_spec.title]
+        else:
+            dash_title = plan.title or question
+            micro = DashboardMicrosession(
+                id=_new_id(),
+                title=dash_title,
+                request=question,
+                charts=charts,
+                summary=dashboard_narrative.summary if dashboard_narrative else f"Собран дашборд «{dash_title}».",
+                points=[c.chart_spec.title or c.question for c in charts],
+                created_at=_now(),
+            )
+            turn.summary = micro.summary
+            turn.points = micro.points
+            if self.dashboards is not None:
+                dashboard_obj = Dashboard(
+                    id=micro.id,
+                    title=dash_title,
+                    session_id=run.session_id,
+                    request=question,
+                    widgets=[
+                        DashboardWidget(
+                            id=c.id,
+                            title=c.chart_spec.title or c.question,
+                            question=c.question,
+                            intent=Intent.CHART,
+                            tool="data_query",
+                            args=c.chart_args,
+                            chart=c.chart_spec,
+                            data=c.table,
+                            summary=c.summary,
+                        )
+                        for c in charts
+                    ],
+                )
+                await self.dashboards.save(dashboard_obj)
+
+        run.state.add_microsession(micro, max_items=self.config.max_microsessions)
+        turn.microsession_id = micro.id
+
+        blocks = self._build_response_blocks(micro, dashboard_narrative)
+        if skipped:
+            skipped_names = ", ".join(t for t, _ in skipped)
+            run.trace.warnings.extend(f"пропущен «{t}»: {r}" for t, r in skipped)
+            blocks.append(TextBlock(markdown=f"Не построены: {skipped_names}."))
+        return self._respond(run, "ok", blocks, follow_ups)
+
+    def _build_response_blocks(
+        self,
+        micro: ChartMicrosession | DashboardMicrosession,
+        dashboard_narrative: Any = None,
+    ) -> list[Block]:
+        blocks: list[Block] = []
+        if isinstance(micro, ChartMicrosession):
+            if micro.summary or micro.points:
+                blocks.append(TextBlock(markdown=micro.summary, points=micro.points))
+            blocks.extend(self._micro_blocks(micro))
+            return blocks
+
+        blocks.append(
+            DashboardBlock(
+                dashboard_id=micro.id,
+                title=micro.title,
+                widget_count=len(micro.charts),
+            )
+        )
+        for c in micro.charts:
+            if c.summary or c.points:
+                blocks.append(TextBlock(markdown=f"**{c.chart_spec.title}**\n{c.summary}", points=c.points))
+            blocks.extend(self._micro_blocks(c))
+        if dashboard_narrative is not None:
+            blocks.append(TextBlock(markdown=dashboard_narrative.summary, points=dashboard_narrative.points))
+        return blocks
+
+    async def _follow_up(self, run: _Run, decision: IntentDecision, turn: Turn) -> AgentResponse:
+        micro = run.state.last_microsession()
+        if micro is None:
             raise _EarlyReply(
                 "clarification",
-                "Не удалось построить ни один график. Уточните, какие показатели нужны?",
+                "Сначала задайте вопрос к данным.",
                 self._examples(run.catalog),
             )
-        turn.summary = " ".join(summaries)[:400] or "Готово."
-        turn.points = titles
-        return self._respond(run, "ok", blocks)
+        if isinstance(micro, DashboardMicrosession):
+            idx = (decision.point_number or 1) - 1
+            if 0 <= idx < len(micro.charts):
+                target_chart = micro.charts[idx]
+                point = target_chart.chart_spec.title or target_chart.question
+            else:
+                options = [f"Подробнее про пункт {i}" for i in range(1, len(micro.charts) + 1)]
+                raise _EarlyReply("clarification", "Уточните, про какой пункт рассказать подробнее?", options)
+        else:
+            target_chart = micro
+            points = micro.points or (run.state.last_turn().points if run.state.last_turn() else [])
+            n = decision.point_number
+            if not points or n is None or n > len(points):
+                options = [f"Подробнее про пункт {i}" for i in range(1, len(points) + 1)]
+                raise _EarlyReply("clarification", "Уточните, про какой пункт рассказать подробнее?", options)
+            point = points[n - 1]
 
-    async def _answer(self, run: _Run, decision: IntentDecision, turn: Turn) -> AgentResponse:
-        question = decision.standalone_question
-        execution = await self._execute(run, decision.intent, question)
-        result = execution.result
-        run.state.set_focus(execution.tables)
-        if result.status is ToolStatus.EMPTY or (result.table is not None and not result.table.rows and not result.facts):
-            text = result.summary_text or EMPTY_RESULT_TEXT
-            turn.summary = text
-            return self._respond(run, "ok", [TextBlock(markdown=text)], self._examples(run.catalog))
-
-        await self._status(run, "writing", "Формулирую ответ")
+        await self._status(run, "writing", "Раскрываю пункт подробнее")
         narrative, warnings = await narrate(
             run.llm,
-            question,
-            result,
+            f"Подробнее про пункт «{point}»",
+            ToolResult(table=target_chart.table),
+            focus=point,
             preview_rows=self.config.preview_rows,
             max_chars=self.config.max_narrative_payload_chars,
-            max_attempts=self.config.max_structured_attempts,
+            max_attempts=self.config.per_step_error_budget,
         )
         run.trace.warnings.extend(warnings)
-
-        chart, note = None, None
-        if result.table is not None and result.table.rows:
-            chart, note = choose_chart(
-                result.table,
-                hint=result.chart_hint,
-                requested=decision.chart_type,
-                title=_title(question),
-                allowed=self.config.chart_types,
-            )
-        artifact = self._store_artifact(run, decision.intent, question, execution, chart)
         turn.summary = narrative.summary
         turn.points = narrative.points
-        turn.artifact_ids = [artifact.id]
-        blocks: list[Block] = [TextBlock(markdown=narrative.summary, points=narrative.points)]
-        blocks += self._result_blocks(artifact, note)
-        blocks += [TextBlock(markdown="Обратите внимание: " + w) for w in result.warnings[:2]]
+        turn.microsession_id = target_chart.id
+        blocks: list[Block] = [
+            TextBlock(markdown=narrative.summary, points=narrative.points),
+            *self._micro_blocks(target_chart),
+        ]
         return self._respond(run, "ok", blocks, narrative.follow_ups)
 
-    async def _change_view(self, run: _Run, decision: IntentDecision, turn: Turn) -> AgentResponse:
-        artifact = run.state.last_artifact()
-        table = artifact.result.table if artifact else None
-        if artifact is None or table is None or not table.rows:
-            raise _EarlyReply("clarification", "Пока нечего перерисовать: сначала задайте вопрос к данным.", self._examples(run.catalog))
-        current = artifact.chart.chart_type if artifact.chart else None
-        title = artifact.chart.title if artifact.chart and artifact.chart.title else _title(artifact.question)
-        note = None
-        if decision.chart_type is not None:
-            spec, note = choose_chart(
-                table, hint=artifact.result.chart_hint, requested=decision.chart_type, title=title,
-                allowed=self.config.chart_types,
-            )
-        else:
-            spec = alternative_chart(table, current, artifact.result.chart_hint, self.config.chart_types)
-            spec = spec.model_copy(update={"title": title}) if spec else None
-        if spec is None:
-            raise _EarlyReply("clarification", "Эти данные не получается показать иначе. Какой вид графика нужен?", [])
-        new_artifact = artifact.model_copy(update={"id": _new_id(), "chart": spec})
-        run.state.add_artifact(new_artifact)
-        text = f"Те же данные, вид: {CHART_LABELS[spec.chart_type]}."
-        turn.summary = text
-        turn.artifact_ids = [new_artifact.id]
-        return self._respond(run, "ok", [TextBlock(markdown=text), *self._result_blocks(new_artifact, note)])
-
-    async def _follow_up(self, run: _Run, decision: IntentDecision, turn: Turn, router: IntentRouter) -> AgentResponse:
-        last = run.state.last_turn()
-        n = decision.point_number
-        if last is None or not last.points or n is None or n > len(last.points):
-            count = len(last.points) if last else 0
-            options = [f"Подробнее про пункт {i}" for i in range(1, count + 1)]
-            raise _EarlyReply("clarification", "Уточните, про какой пункт рассказать подробнее?", options)
-        point = last.points[n - 1]
-        context = last.standalone_question or last.user_message
-        message = f"Расскажи подробнее: {point} (это пункт ответа на вопрос «{context}»)"
-        detail = await router.classify(message, run.state, run.catalog, allowed=sorted(ANALYTIC_INTENTS))
-        run.trace.standalone_question = detail.standalone_question
-        run.trace.warnings.append(f"пункт {n} переклассифицирован как {detail.intent.value}")
-        turn.standalone_question = detail.standalone_question
-        return await self._answer(run, detail, turn)
-
-    async def _dashboard(self, run: _Run, decision: IntentDecision, turn: Turn, message: str) -> AgentResponse:
-        await self._status(run, "dashboard", "Проектирую дашборд")
-        tables = select_tables(
-            decision.standalone_question, run.catalog, focus=run.state.focus_tables, max_tables=self.config.max_schema_tables
-        )
-        allowed = [i for i in Intent if i in ANALYTIC_INTENTS]
-        schema = model_schema(DashboardPlan)
-        schema["properties"]["widgets"]["items"]["properties"]["intent"]["enum"] = [i.value for i in allowed]
-        prompt = DASHBOARD_SYSTEM.format(
-            intents=", ".join(i.value for i in allowed),
-            schema=render_schema(run.catalog, tables, max_columns=self.config.max_schema_columns),
-        )
-        plan = await generate_structured(
-            run.llm,
-            [system_msg(prompt), user_msg(decision.standalone_question)],
-            DashboardPlan,
-            schema=schema,
-            schema_name="dashboard_plan",
-            max_attempts=self.config.max_structured_attempts,
-        )
-        widgets: list[DashboardWidget] = []
-        skipped: list[str] = []
-        for wp in plan.widgets:
-            intent = _widget_intent(wp.intent, wp.chart_type)
-            ex = await self._widget_execution(run, intent, wp.title, wp.question)
-            if ex is None and intent is not Intent.DATA_QUESTION:
-                intent = Intent.DATA_QUESTION
-                ex = await self._widget_execution(run, intent, wp.title, wp.question)
-            if ex is None:
-                skipped.append(wp.title)
-                continue
-            chart, _ = choose_chart(
-                ex.result.table, hint=ex.result.chart_hint, requested=wp.chart_type, title=wp.title,
-                allowed=self.config.chart_types,
-            )
-            widgets.append(
-                DashboardWidget(
-                    id=_new_id(),
-                    title=wp.title,
-                    question=wp.question,
-                    intent=intent,
-                    tool=ex.tool.name,
-                    args=ex.args.model_dump(mode="json"),
-                    chart=chart or ChartSpec(chart_type=ChartType.TABLE, title=wp.title),
-                    data=ex.result.table.head(self.config.stored_rows),
-                    summary=ex.result.summary_text or "",
-                )
-            )
-        if not widgets:
-            raise _EarlyReply(
-                "clarification", "Не получилось собрать ни одного виджета. Уточните, какие показатели нужны?", self._examples(run.catalog)
-            )
-        dashboard = Dashboard(id=_new_id(), title=plan.title, session_id=run.session_id, request=message, widgets=widgets)
-        if self.dashboards is not None:
-            await self.dashboards.save(dashboard)
-        text = f"Собрал дашборд «{dashboard.title}» из {len(widgets)} виджетов."
-        if skipped:
-            text += f" Не удалось построить: {', '.join(skipped)}."
-        turn.summary = text
-        turn.points = [w.title for w in widgets]
-        blocks: list[Block] = [
-            TextBlock(markdown=text, points=turn.points),
-            DashboardBlock(dashboard_id=dashboard.id, title=dashboard.title, widget_count=len(widgets)),
-        ]
-        for w in widgets:
-            chart_block = None
-            if w.chart and w.chart.chart_type is not ChartType.TABLE:
-                chart_block = self._chart_block(f"{dashboard.id}-{w.id}", w.chart, w.data, None)  # type: ignore[arg-type]
-            blocks.append(chart_block or TableBlock(id=f"{dashboard.id}-{w.id}", title=w.title, data=w.data))  # type: ignore[arg-type]
-        return self._respond(run, "ok", blocks)
-
-    async def _widget_execution(self, run: _Run, intent: Intent, title: str, question: str) -> _Execution | None:
+    async def _explain_failure(
+        self, run: _Run, question: str, skipped: list[tuple[str, str]]
+    ) -> tuple[str, list[str]]:
+        failures_str = "; ".join(f"{t} ({r})" for t, r in skipped) or "не удалось собрать корректный DSL"
+        prompt = EXPLAIN_FAILURE_SYSTEM.format(question=question, failures=failures_str)
         try:
-            ex = await self._execute(run, intent, question)
-        except (LLMError, StructuredOutputError, _EarlyReply) as e:
-            run.trace.warnings.append(f"виджет «{title}» ({intent.value}) не построен: {e}")
-            return None
-        if ex.result.status is not ToolStatus.OK or ex.result.table is None or not ex.result.table.rows:
-            run.trace.warnings.append(f"виджет «{title}» ({intent.value}) без данных")
-            return None
-        return ex
-
-    async def _execute(self, run: _Run, intent: Intent, question: str) -> _Execution:
-        tools = self.tools.for_intent(intent) or self.tools.for_intent(Intent.DATA_QUESTION)
-        if not tools:
-            raise _EarlyReply("clarification", NOT_IMPLEMENTED_TEXT, self._examples(run.catalog))
-        tool = tools[0] if len(tools) == 1 else await self._choose_tool(run, tools, question)
-        tables = select_tables(
-            question, run.catalog, focus=run.state.focus_tables, max_tables=self.config.max_schema_tables
-        )
-        await self._status(run, "planning", "Готовлю расчёт")
-        feedback: tuple[BaseModel, str] | None = None
-        for attempt in range(self.config.max_tool_repairs + 1):
-            args = await self._fill_args(run, tool, question, tables, feedback)
-            await self._status(run, "running_tool", "Считаю")
-            result = await self._run_tool(run, tool, args, question)
-            if result.status is ToolStatus.RETRYABLE_ERROR and attempt < self.config.max_tool_repairs:
-                feedback = (args, result.error or "инструмент вернул ошибку")
-                continue
-            break
-        if result.status is ToolStatus.RETRYABLE_ERROR:
-            raise _EarlyReply(
-                "clarification",
-                "Не получилось построить расчёт для этого вопроса. Уточните, какие поля или период использовать?",
-                self._examples(run.catalog),
+            explanation = await generate_structured(
+                run.llm,
+                [system_msg(prompt), user_msg(question)],
+                FailureExplanation,
+                schema_name="explain_failure",
+                max_attempts=1,
             )
-        if result.status is ToolStatus.ERROR:
-            raise _EarlyReply("error", result.error or GENERIC_ERROR_TEXT, retryable=True)
-        result.chart_hint = mention_hint(result.table, question, result.chart_hint)
-        return _Execution(tool, args, result, self._tables_used(tool, args) or tables)
-
-    async def _choose_tool(self, run: _Run, tools: list[BaseTool], question: str) -> BaseTool:
-        names = [t.name for t in tools]
-        schema = {"type": "object", "properties": {"tool": {"type": "string", "enum": names}}, "required": ["tool"]}
-        prompt = TOOL_CHOICE_SYSTEM.format(tools="\n".join(f"- {t.name}: {t.description}" for t in tools))
-        choice = await generate_structured(
-            run.llm,
-            [system_msg(prompt), user_msg(question)],
-            ToolChoice,
-            schema=schema,
-            schema_name="tool_choice",
-            max_attempts=self.config.max_structured_attempts,
-            validate=lambda c: [] if c.tool in names else [f"tool должен быть одним из: {', '.join(names)}"],
-        )
-        return next(t for t in tools if t.name == choice.tool)
-
-    async def _fill_args(
-        self, run: _Run, tool: BaseTool, question: str, tables: list[str], feedback: tuple[BaseModel, str] | None
-    ) -> BaseModel:
-        if not tool.args_model.model_fields:
-            return tool.args_model()
-        catalog = run.catalog
-        fields = catalog_fields(tool.args_model)
-        all_tables = [t.name for t in catalog.tables]
-        all_columns = catalog.column_refs()
-        schema = build_args_schema(tool.args_model, all_tables, catalog.column_refs(tables))
-        prompt = ARGS_SYSTEM.format(
-            name=tool.name,
-            description=tool.description,
-            hint=tool.args_hint,
-            refs="; колонку указывай как «таблица.колонка»" if "column" in fields.values() else "",
-            schema=render_schema(catalog, tables, max_columns=self.config.max_schema_columns),
-        )
-        content = ARGS_USER.format(question=question)
-        if feedback is not None:
-            content += ARGS_FEEDBACK.format(args=feedback[0].model_dump_json(), error=feedback[1])
-        llm = run.sql_llm if tool.llm_role == "sql" else run.llm
-
-        def _preprocess(data: dict) -> dict:
-            data = fix_catalog_refs(data, fields, all_tables, all_columns)
-            return tool.preprocess_args(data, catalog)
-
-        return await generate_structured(
-            llm,
-            [system_msg(prompt), user_msg(content)],
-            tool.args_model,
-            schema=schema,
-            schema_name=f"args_{tool.name}",
-            max_attempts=self.config.max_structured_attempts,
-            preprocess=_preprocess,
-            validate=lambda args: check_catalog_refs(args, fields, catalog),
-        )
-
-    async def _run_tool(self, run: _Run, tool: BaseTool, args: BaseModel, question: str) -> ToolResult:
-        ctx = ToolContext(run.catalog, self.executor, run.session_id, question, run.llm)
-        started = time.monotonic()
-        try:
-            result = await asyncio.wait_for(tool.run(args, ctx), self.config.tool_timeout_s)
-        except QueryError as e:
-            result = ToolResult(status=ToolStatus.RETRYABLE_ERROR, error=f"ошибка базы данных: {e.message}")
-        except TimeoutError:
-            result = ToolResult(status=ToolStatus.ERROR, error=TOOL_TIMEOUT_TEXT)
+            options = explanation.options or self._examples(run.catalog)
+            return explanation.message, options[:3]
         except Exception:
-            log.exception("tool %s failed", tool.name)
-            result = ToolResult(status=ToolStatus.ERROR, error=GENERIC_ERROR_TEXT)
-        run.trace.tool_calls.append(
-            ToolCallTrace(
-                tool=tool.name,
-                args=args.model_dump(mode="json"),
-                status=result.status.value,
-                elapsed_ms=int((time.monotonic() - started) * 1000),
-                sql=result.sql,
-                error=result.error,
+            return (
+                "Не удалось построить график по этому запросу. Уточните, какие показатели и за какой период нужны?",
+                self._examples(run.catalog)[:3],
             )
-        )
-        return result
-
-    @staticmethod
-    def _tables_used(tool: BaseTool, args: BaseModel) -> list[str]:
-        used: list[str] = []
-        for name, kind in catalog_fields(tool.args_model).items():
-            value = getattr(args, name, None)
-            for v in value if isinstance(value, list) else [value]:
-                if isinstance(v, str):
-                    used.append(v if kind == "table" else split_column_ref(v)[0])
-        return list(dict.fromkeys(used))
-
-    def _store_artifact(
-        self, run: _Run, intent: Intent, question: str, execution: _Execution, chart: ChartSpec | None
-    ) -> Artifact:
-        result = execution.result
-        if result.table is not None:
-            result = result.model_copy(update={"table": result.table.head(self.config.stored_rows)})
-        artifact = Artifact(
-            id=_new_id(),
-            question=question,
-            intent=intent,
-            tool=execution.tool.name,
-            args=execution.args.model_dump(mode="json"),
-            result=result,
-            chart=chart,
-        )
-        run.state.add_artifact(artifact)
-        return artifact
 
     def _export(self, spec: ChartSpec, data: ResultTable) -> dict[str, Any] | None:
         try:
@@ -712,7 +709,10 @@ class Agent:
                 alt = alt.model_copy(update={"title": spec.title})
                 engine_spec = self._export(alt, data)
                 if engine_spec is not None:
-                    reason = f"{CHART_LABELS[spec.chart_type].capitalize()} для этих данных не строится, показываю: {CHART_LABELS[alt.chart_type]}."
+                    reason = (
+                        f"{CHART_LABELS[spec.chart_type].capitalize()} для этих данных не строится, "
+                        f"показываю: {CHART_LABELS[alt.chart_type]}."
+                    )
                     note = f"{note} {reason}" if note else reason
                     spec = alt
                     break
@@ -721,19 +721,19 @@ class Agent:
             return None
         return ChartBlock(id=block_id, spec=spec, data=data, note=note, engine_spec=engine_spec)
 
-    def _result_blocks(self, artifact: Artifact, note: str | None) -> list[Block]:
-        table: ResultTable | None = artifact.result.table
-        if table is None or not table.rows:
+    def _micro_blocks(self, micro: ChartMicrosession) -> list[Block]:
+        table = micro.table
+        if not table.rows:
             return []
-        chart = artifact.chart
+        spec = micro.chart_spec
         blocks: list[Block] = []
         chart_block = None
-        if chart is not None and chart.chart_type is not ChartType.TABLE:
-            chart_block = self._chart_block(f"{artifact.id}-chart", chart, table, note)
+        if spec.chart_type is not ChartType.TABLE:
+            chart_block = self._chart_block(f"{micro.id}-chart", spec, table, micro.note)
         if chart_block is not None:
             blocks.append(chart_block)
         if chart_block is None or chart_block.spec.chart_type is not ChartType.KPI:
-            blocks.append(TableBlock(id=f"{artifact.id}-table", title=chart.title if chart else "", data=table))
+            blocks.append(TableBlock(id=f"{micro.id}-table", title=spec.title, data=table))
         return blocks
 
     def _respond(

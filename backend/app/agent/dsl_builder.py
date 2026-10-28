@@ -1,0 +1,112 @@
+from __future__ import annotations
+
+import json
+
+from app.query_system import QueryEngine
+
+from .catalog_refs import fix_query_args_columns
+from .contracts.catalog import Catalog
+from .contracts.response import ChartType
+from .error_budget import ErrorBudget
+from .integrations.dsl_exec import catalog_schema
+from .integrations.query_dsl import QueryArgs, format_errors
+from .llm.client import ChatMessage, LLMClient, system_msg, user_msg
+from .llm.errors import StructuredOutputError
+from .llm.structured import generate_structured
+from .pipeline_validator import validate_chart_pipeline
+from .prompts import DSL_EXAMPLES_BY_TYPE, DSL_FEEDBACK, DSL_SYSTEM
+from .schema_linking import render_schema
+
+_engine = QueryEngine()
+
+
+def _validate_against_engine(args: QueryArgs, catalog: Catalog, tables: list[str]) -> list[str]:
+    full_schema = catalog_schema(catalog)
+    if tables:
+        scoped = {t: full_schema[t] for t in tables if t in full_schema}
+        schema = scoped or full_schema
+    else:
+        schema = full_schema
+    query = _engine.from_dict(args.to_engine())
+    validation = _engine.validate(query, schema)
+    if validation.ok:
+        return []
+    return [format_errors(validation.errors)]
+
+
+def _messages(
+    question: str,
+    chart_type: ChartType,
+    title: str,
+    purpose: str,
+    catalog: Catalog,
+    tables: list[str],
+    feedback: tuple[QueryArgs | None, str] | None,
+) -> list[ChatMessage]:
+    type_key = "card" if chart_type is ChartType.KPI else chart_type.value
+    example_dict = DSL_EXAMPLES_BY_TYPE.get(type_key, DSL_EXAMPLES_BY_TYPE["bar"])
+    schema_text = render_schema(catalog, tables)
+    prompt = DSL_SYSTEM.format(
+        chart_type=type_key,
+        question=question,
+        purpose=purpose or title,
+        schema=schema_text,
+        example_json=json.dumps(example_dict, ensure_ascii=False),
+    )
+    user_content = f"Заголовок графика: «{title}».\nВопрос: {question}\nНазначение: {purpose or title}"
+    if feedback is not None:
+        prev_args, err_text = feedback
+        prev_json = (
+            json.dumps(prev_args.to_engine(), ensure_ascii=False)
+            if prev_args is not None
+            else "(невалидный JSON)"
+        )
+        user_content += DSL_FEEDBACK.format(prev_dsl=prev_json, error=err_text)
+    return [system_msg(prompt), user_msg(user_content)]
+
+
+async def build_dsl(
+    llm: LLMClient,
+    *,
+    question: str,
+    chart_type: ChartType,
+    title: str,
+    purpose: str = "",
+    catalog: Catalog,
+    tables: list[str],
+    budget: ErrorBudget,
+    max_attempts_per_step: int = 2,
+) -> tuple[QueryArgs | None, list[str]]:
+    """LLM #3 + repair-loop. Возвращает (QueryArgs | None, warnings)."""
+    warnings: list[str] = []
+    feedback: tuple[QueryArgs | None, str] | None = None
+    total_tries = max_attempts_per_step + 1
+
+    for attempt in range(total_tries):
+        if attempt > 0 and not budget.consume(f"dsl:{title}"):
+            warnings.append(f"{title}: бюджет исчерпан")
+            return None, warnings
+        try:
+            args = await generate_structured(
+                llm,
+                _messages(question, chart_type, title, purpose, catalog, tables, feedback),
+                QueryArgs,
+                schema_name="dsl_query",
+                max_attempts=1,
+                preprocess=lambda d: fix_query_args_columns(d, catalog),
+                validate=lambda a: validate_chart_pipeline(a, chart_type=chart_type.value),
+            )
+        except StructuredOutputError as e:
+            err_msg = e.errors[0] if e.errors else "невалидный JSON"
+            warnings.append(f"{title}: невалидный DSL ({err_msg})")
+            feedback = (None, err_msg)
+            continue
+
+        dsl_errors = _validate_against_engine(args, catalog, tables)
+        if not dsl_errors:
+            return args, warnings
+
+        warnings.append(f"{title}: {dsl_errors[0]}")
+        feedback = (args, dsl_errors[0])
+
+    return None, warnings
