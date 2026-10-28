@@ -224,8 +224,9 @@ class Agent:
                 result = await asyncio.wait_for(
                     tool.run(tool.args_model.model_validate(widget.args), ctx), self.config.tool_timeout_s
                 )
-            except Exception:
+            except Exception as e:
                 log.exception("dashboard %s widget %s refresh failed", dashboard_id, widget.id)
+                log.warning("виджет «%s» не обновлен: %s", widget.title, e)
                 continue
             if result.status is ToolStatus.OK and result.table is not None:
                 widget.data = result.table.head(self.config.stored_rows)
@@ -359,8 +360,8 @@ class Agent:
             )
             try:
                 execution = await self._execute(run, intent, chart_question)
-            except _EarlyReply as e:
-                run.trace.warnings.append(f"график «{item.title}» пропущен: {e.text}")
+            except (LLMError, StructuredOutputError, _EarlyReply) as e:
+                run.trace.warnings.append(f"график «{item.title}» ({item.chart_type.value}) пропущен: {e}")
                 continue
             if execution.result.status is not ToolStatus.OK:
                 continue
@@ -552,7 +553,7 @@ class Agent:
     async def _widget_execution(self, run: _Run, intent: Intent, title: str, question: str) -> _Execution | None:
         try:
             ex = await self._execute(run, intent, question)
-        except (_EarlyReply, StructuredOutputError) as e:
+        except (LLMError, StructuredOutputError, _EarlyReply) as e:
             run.trace.warnings.append(f"виджет «{title}» ({intent.value}) не построен: {e}")
             return None
         if ex.result.status is not ToolStatus.OK or ex.result.table is None or not ex.result.table.rows:
