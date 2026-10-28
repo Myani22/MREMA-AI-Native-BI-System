@@ -10,7 +10,6 @@ __pycache__/
 .env
 .env.*
 .env_folder/
-!.env.example
 *.py[cod]
 .venv/
 
