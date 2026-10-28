@@ -25,6 +25,8 @@ services:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-mrema}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-mrema}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:3000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     depends_on:
