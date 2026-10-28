@@ -38,19 +38,19 @@ def _catalog() -> Catalog:
 @pytest.mark.asyncio
 async def test_dsl_builder_repairs_invalid_order():
     bad_dsl = {
-        "steps": [
-            {"var": "T", "op": "source", "table": "orders"},
-            {
-                "var": "A",
-                "op": "aggregate",
-                "input": "T",
-                "group_by": ["city"],
-                "aggregates": [{"func": "sum", "column": "amount", "alias": "Выручка"}],
-            },
-            {"var": "S", "op": "sort", "input": "A", "by": [{"column": "Выручка", "dir": "desc"}]},
-        ],
-        "output": "S",
-    }
+            "steps": [
+                {"var": "T", "op": "source", "table": "orders"},
+                {"var": "L", "op": "limit", "input": "T", "n": 10}, 
+                {
+                    "var": "A",
+                    "op": "aggregate",
+                    "input": "L",
+                    "group_by": ["city"],
+                    "aggregates": [{"func": "sum", "column": "amount", "alias": "Выручка"}],
+                },
+            ],
+            "output": "A",
+        }
     good_dsl = {
         "steps": [
             {"var": "T", "op": "source", "table": "orders"},

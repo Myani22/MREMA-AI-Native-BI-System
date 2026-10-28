@@ -84,9 +84,6 @@ def validate_chart_pipeline(args: QueryArgs, *, chart_type: str) -> list[str]:
     if op_counts["join"] > 0 and op_counts["source"] != 2:
         errors.append("join требует ровно 2 source")
 
-    normalized_type = "kpi" if chart_type == "card" else chart_type
-    if op_counts["sort"] > 0 and normalized_type != "table":
-        errors.append(f"sort запрещён для chart_type={chart_type} (разрешён только для table)")
     if op_counts["sort"] > 0 and op_counts["aggregate"] == 0:
         errors.append("sort требует aggregate перед ним (или уберите sort)")
 

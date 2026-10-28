@@ -81,26 +81,46 @@ async def build_dsl(
     warnings: list[str] = []
     feedback: tuple[QueryArgs | None, str] | None = None
     total_tries = max_attempts_per_step + 1
+    seen_hashes = set()
 
     for attempt in range(total_tries):
         if attempt > 0 and not budget.consume(f"dsl:{title}"):
             warnings.append(f"{title}: бюджет исчерпан")
             return None, warnings
+
+        messages = _messages(question, chart_type, title, purpose, catalog, tables, feedback)
+        prompt_text = "\n".join(m.content for m in messages)
+
         try:
             args = await generate_structured(
                 llm,
-                _messages(question, chart_type, title, purpose, catalog, tables, feedback),
+                messages,
                 QueryArgs,
                 schema_name="dsl_query",
                 max_attempts=1,
                 preprocess=lambda d: fix_query_args_columns(d, catalog),
                 validate=lambda a: validate_chart_pipeline(a, chart_type=chart_type.value),
             )
+            completion_text = args.model_dump_json()
         except StructuredOutputError as e:
+            completion_text = e.raw
+            
+            h = hash((prompt_text, completion_text))
+            if h in seen_hashes:
+                warnings.append(f"{title}: модель повторила тот же ответ")
+                return None, warnings
+            seen_hashes.add(h)
+
             err_msg = e.errors[0] if e.errors else "невалидный JSON"
             warnings.append(f"{title}: невалидный DSL ({err_msg})")
             feedback = (None, err_msg)
             continue
+
+        h = hash((prompt_text, completion_text))
+        if h in seen_hashes:
+            warnings.append(f"{title}: модель повторила тот же ответ")
+            return None, warnings
+        seen_hashes.add(h)
 
         dsl_errors = _validate_against_engine(args, catalog, tables)
         if not dsl_errors:
@@ -109,4 +129,4 @@ async def build_dsl(
         warnings.append(f"{title}: {dsl_errors[0]}")
         feedback = (args, dsl_errors[0])
 
-    return None, warnings
+        return None, warnings

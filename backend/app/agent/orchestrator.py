@@ -628,16 +628,14 @@ class Agent:
     async def _follow_up(self, run: _Run, decision: IntentDecision, turn: Turn) -> AgentResponse:
         micro = run.state.last_microsession()
         if micro is None:
-            raise _EarlyReply(
-                "clarification",
-                "Сначала задайте вопрос к данным.",
-                self._examples(run.catalog),
-            )
+            raise _EarlyReply("clarification", "Сначала задайте вопрос к данным.", self._examples(run.catalog))
+
         if isinstance(micro, DashboardMicrosession):
             idx = (decision.point_number or 1) - 1
             if 0 <= idx < len(micro.charts):
                 target_chart = micro.charts[idx]
                 point = target_chart.chart_spec.title or target_chart.question
+                question_text = f"Подробнее про график «{point}»"
             else:
                 options = [f"Подробнее про пункт {i}" for i in range(1, len(micro.charts) + 1)]
                 raise _EarlyReply("clarification", "Уточните, про какой пункт рассказать подробнее?", options)
@@ -645,16 +643,24 @@ class Agent:
             target_chart = micro
             points = micro.points or (run.state.last_turn().points if run.state.last_turn() else [])
             n = decision.point_number
-            if not points or n is None or n > len(points):
-                options = [f"Подробнее про пункт {i}" for i in range(1, len(points) + 1)]
-                raise _EarlyReply("clarification", "Уточните, про какой пункт рассказать подробнее?", options)
-            point = points[n - 1]
+            if n is None:
+                point = target_chart.chart_spec.title or target_chart.question
+                question_text = f"Объясни подробнее данные графика: {point}"
+            else:
+                if not points or n > len(points):
+                    options = [f"Подробнее про пункт {i}" for i in range(1, len(points) + 1)] if points else []
+                    raise _EarlyReply("clarification", "Уточните, про какой пункт рассказать подробнее?", options)
+                point = points[n - 1]
+                question_text = f"Подробнее про пункт «{point}»"
 
-        await self._status(run, "writing", "Раскрываю пункт подробнее")
+        await self._status(run, "writing", "Раскрываю подробнее")
         narrative, warnings = await narrate(
             run.llm,
-            f"Подробнее про пункт «{point}»",
-            ToolResult(table=target_chart.table),
+            question_text,
+            ToolResult(
+                table=target_chart.table,
+                sql=str(target_chart.chart_args),
+            ),
             focus=point,
             preview_rows=self.config.preview_rows,
             max_chars=self.config.max_narrative_payload_chars,
@@ -673,23 +679,29 @@ class Agent:
     async def _explain_failure(
         self, run: _Run, question: str, skipped: list[tuple[str, str]]
     ) -> tuple[str, list[str]]:
-        failures_str = "; ".join(f"{t} ({r})" for t, r in skipped) or "не удалось собрать корректный DSL"
-        prompt = EXPLAIN_FAILURE_SYSTEM.format(question=question, failures=failures_str)
-        try:
-            explanation = await generate_structured(
-                run.llm,
-                [system_msg(prompt), user_msg(question)],
-                FailureExplanation,
-                schema_name="explain_failure",
-                max_attempts=1,
-            )
-            options = explanation.options or self._examples(run.catalog)
-            return explanation.message, options[:3]
-        except Exception:
-            return (
-                "Не удалось построить график по этому запросу. Уточните, какие показатели и за какой период нужны?",
-                self._examples(run.catalog)[:3],
-            )
+        failures_str = "; ".join(f"{t} ({r})" for t, r in skipped) or "не удалось собрать запрос"
+        return f"Не удалось построить: {failures_str}", self._examples(run.catalog)[:3]
+
+    # async def _explain_failure(
+    #     self, run: _Run, question: str, skipped: list[tuple[str, str]]
+    # ) -> tuple[str, list[str]]:
+    #     failures_str = "; ".join(f"{t} ({r})" for t, r in skipped) or "не удалось собрать корректный DSL"
+    #     prompt = EXPLAIN_FAILURE_SYSTEM.format(question=question, failures=failures_str)
+    #     try:
+    #         explanation = await generate_structured(
+    #             run.llm,
+    #             [system_msg(prompt), user_msg(question)],
+    #             FailureExplanation,
+    #             schema_name="explain_failure",
+    #             max_attempts=1,
+    #         )
+    #         options = explanation.options or self._examples(run.catalog)
+    #         return explanation.message, options[:3]
+    #     except Exception:
+    #         return (
+    #             "Не удалось построить график по этому запросу. Уточните, какие показатели и за какой период нужны?",
+    #             self._examples(run.catalog)[:3],
+    #         )
 
     def _export(self, spec: ChartSpec, data: ResultTable) -> dict[str, Any] | None:
         try:

@@ -168,11 +168,14 @@ DSL_SYSTEM = """Собери DSL для графика {chart_type}.
 - Порядок: source(+source+join) → filter → aggregate → sort → limit.
 - filter — только до aggregate. Для post-filter используй having внутри aggregate.
 - aggregate — ровно один. group_by = колонки X (+ series). aggregates = колонки Y (доступны: count, count_distinct, sum, avg, min, max).
+- alias — по-русски и отражает смысл агрегата:
+  - sum → «Выручка» / «Сумма»
+  - avg → «Средний чек» / «Среднее»
+  - count → «Количество»
+  - count_distinct → «Уникальных»
+  - min/max → «Минимум»/«Максимум»
+  Не копируй имя колонки в alias, если агрегат меняет смысл.
 - sort — ТОЛЬКО для chart_type=table, только после aggregate, только по group_by/alias.
-- limit — только последний шаг, n>0.
-- output = последний var.
-- Имена колонок — точно как в схеме, без кавычек.
-- Для карточки (card): group_by=[], один aggregate.
 
 Пример для {chart_type}:
 {example_json}

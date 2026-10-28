@@ -98,10 +98,12 @@ def route_by_rules(message: str, state: SessionState) -> IntentDecision | None:
         return decision(Intent.META_HELP)
 
     points = _available_points(state)
-    if points and _FOLLOW_UP_RE.search(text):
+    if _FOLLOW_UP_RE.search(text):
         number = _point_number(text)
-        if number is not None:
+        if number is not None and points:
             return decision(Intent.FOLLOW_UP, point_number=number)
+        if state.last_microsession() is not None:
+            return decision(Intent.FOLLOW_UP)
 
     micro = state.last_microsession()
     if micro is not None:

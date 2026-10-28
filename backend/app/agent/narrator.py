@@ -100,6 +100,27 @@ def _fallback(result: ToolResult) -> Narrative:
     return Narrative(summary=result.summary_text or "Готово, результат ниже.")
 
 
+def _filter_follow_ups(follow_ups: list[str], payload_text: str) -> list[str]:
+    valid = []
+    allowed_years = set(re.findall(r"\b20\d{2}\b", payload_text))
+    
+    for f in follow_ups:
+        years = set(re.findall(r"\b20\d{2}\b", f))
+        if not years or years.issubset(allowed_years):
+            valid.append(f)
+    
+    defaults = [
+        "Какие ещё показатели можно посмотреть?",
+        "Сгруппируй эти данные по-другому.",
+        "Покажи данные в виде таблицы."
+    ]
+    while len(valid) < 2 and defaults:
+        d = defaults.pop(0)
+        if d not in valid:
+            valid.append(d)
+            
+    return valid[:3]
+
 async def narrate(
     llm: LLMClient,
     question: str,
@@ -134,9 +155,17 @@ async def narrate(
     if result.summary_text:
         warnings.append("показан шаблонный текст инструмента")
         return _fallback(result), warnings
+
     if ungrounded_numbers(narrative.summary, payload):
         return _fallback(result), warnings
-    return Narrative(summary=narrative.summary), warnings
+    
+    filtered_follow_ups = _filter_follow_ups(narrative.follow_ups, payload_text)
+    
+    return Narrative(
+        summary=narrative.summary,
+        points=narrative.points,
+        follow_ups=filtered_follow_ups
+    ), warnings
 
 
 async def narrate_dashboard(

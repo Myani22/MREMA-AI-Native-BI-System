@@ -67,7 +67,7 @@ def test_forbidden_ops_rejected():
     assert any("distinct запрещён" in e for e in errors)
 
 
-def test_sort_allowed_only_for_table():
+def test_sort_allowed_for_all_charts():
     args = _parse(
         {
             "steps": [
@@ -86,7 +86,7 @@ def test_sort_allowed_only_for_table():
     )
     assert validate_chart_pipeline(args, chart_type="table") == []
     bar_errors = validate_chart_pipeline(args, chart_type="bar")
-    assert any("sort запрещён" in e for e in bar_errors)
+    assert bar_errors == []
 
 
 def test_filter_after_aggregate_rejected():
