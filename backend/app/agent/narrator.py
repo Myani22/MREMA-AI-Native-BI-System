@@ -6,6 +6,8 @@ import math
 import re
 from typing import TYPE_CHECKING, Any
 
+from itertools import combinations_with_replacement
+
 from pydantic import BaseModel, Field
 
 from .contracts.tools import ToolResult
@@ -67,6 +69,7 @@ def _collect_numbers(obj: Any, out: set[float]) -> None:
 def ungrounded_numbers(text: str, source: Any) -> list[str]:
     allowed: set[float] = set()
     _collect_numbers(source, allowed)
+    allowed_list = list(allowed)
     bad = []
     for m in _NUMBER_RE.finditer(text):
         parsed = _parse_number(m.group())
@@ -76,7 +79,19 @@ def ungrounded_numbers(text: str, source: Any) -> list[str]:
         if decimals == 0 and abs(value) <= _SMALL_INT_LIMIT:
             continue
         tolerance = 0.5 * 10**-decimals + 1e-9
-        if not any(abs(value - a * s) <= tolerance for a in allowed for s in _SCALES):
+        
+        valid = False
+        for r in (1, 2, 3):
+            for combo in combinations_with_replacement(allowed_list, r):
+                val_sum = sum(combo)
+                for s in _SCALES:
+                    if abs(value - val_sum * s) <= tolerance:
+                        valid = True
+                        break
+                if valid: break
+            if valid: break
+            
+        if not valid:
             bad.append(m.group())
     return bad
 
@@ -138,34 +153,26 @@ async def narrate(
         user_content += NARRATOR_FOCUS.format(focus=focus)
     messages = [system_msg(NARRATOR_SYSTEM), user_msg(user_content)]
     warnings: list[str] = []
-    for attempt in range(2):
-        narrative = await generate_structured(
-            llm, messages, Narrative, schema_name="narrative", max_attempts=max_attempts, temperature=0.2
-        )
-        bad = ungrounded_numbers(" ".join([narrative.summary, *narrative.points]), payload)
-        if not bad:
-            return narrative, warnings
-        warnings.append(f"числа без опоры на данные (попытка {attempt + 1}): {', '.join(bad)}")
-        log.info("narrative has ungrounded numbers: %s", bad)
-        messages = [
-            *messages,
-            assistant_msg(narrative.model_dump_json()),
-            user_msg(GROUNDING_FEEDBACK.format(numbers=", ".join(bad))),
-        ]
+    
+    narrative = await generate_structured(
+        llm, messages, Narrative, schema_name="narrative", max_attempts=max_attempts, temperature=0.2
+    )
+    bad = ungrounded_numbers(" ".join([narrative.summary, *narrative.points]), payload)
+    
+    if not bad:
+        filtered_follow_ups = _filter_follow_ups(narrative.follow_ups, payload_text)
+        return Narrative(
+            summary=narrative.summary,
+            points=narrative.points,
+            follow_ups=filtered_follow_ups
+        ), warnings
+
+    warnings.append(f"числа без опоры на данные: {', '.join(bad)}")
+    log.info("narrative has ungrounded numbers: %s", bad)
+    
     if result.summary_text:
         warnings.append("показан шаблонный текст инструмента")
-        return _fallback(result), warnings
-
-    if ungrounded_numbers(narrative.summary, payload):
-        return _fallback(result), warnings
-    
-    filtered_follow_ups = _filter_follow_ups(narrative.follow_ups, payload_text)
-    
-    return Narrative(
-        summary=narrative.summary,
-        points=narrative.points,
-        follow_ups=filtered_follow_ups
-    ), warnings
+    return _fallback(result), warnings
 
 
 async def narrate_dashboard(

@@ -129,4 +129,4 @@ async def build_dsl(
         warnings.append(f"{title}: {dsl_errors[0]}")
         feedback = (args, dsl_errors[0])
 
-        return None, warnings
+    return None, warnings

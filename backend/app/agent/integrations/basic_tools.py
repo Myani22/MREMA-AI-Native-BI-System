@@ -59,6 +59,9 @@ class OverviewTool(BaseTool):
         if relations:
             facts["связи"] = relations
         total = sum(t.row_count for t in catalog.tables)
+        facts: dict[str, Any] = {"таблиц": len(catalog.tables), "таблицы": tables, "всего_строк": total}
+        if relations:
+            facts["связи"] = relations
         summary = f"Загружено таблиц: {len(catalog.tables)}, всего строк: {total}."
         table = ResultTable(
             columns=[

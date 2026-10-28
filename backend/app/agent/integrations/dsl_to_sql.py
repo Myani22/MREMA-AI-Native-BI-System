@@ -37,6 +37,15 @@ def _q(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def _col(name: str, alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    if name.endswith(" (месяц)"):
+        return f"date_trunc('month', {prefix}{_q(name[:-8])})"
+    if name.endswith(" (год)"):
+        return f"EXTRACT(YEAR FROM {prefix}{_q(name[:-6])})::int"
+    return f"{prefix}{_q(name)}"
+
+
 def _lit(v: Any) -> str:
     if v is None:
         return "NULL"
@@ -49,7 +58,7 @@ def _lit(v: Any) -> str:
 
 def _cond(c: Condition) -> str:
     if isinstance(c, Leaf):
-        col = _q(c.column)
+        col = _col(c.column)
         if c.cmp in _CMP:
             if c.value is None:
                 return f"{col} IS NULL" if c.cmp == "eq" else f"{col} IS NOT NULL" if c.cmp == "ne" else "FALSE"
@@ -81,14 +90,14 @@ def _agg(a: Any) -> str:
     if a.func == "count_distinct":
         if a.column == "*":
             return f"COUNT(*) AS {_q(a.alias)}"
-        return f"COUNT(DISTINCT {_q(a.column)}) AS {_q(a.alias)}"
+        return f"COUNT(DISTINCT {_col(a.column)}) AS {_q(a.alias)}"
     if a.column == "*":
         return f"COUNT(*) AS {_q(a.alias)}"
-    return f"{a.func.upper()}({_q(a.column)}) AS {_q(a.alias)}"
+    return f"{a.func.upper()}({_col(a.column)}) AS {_q(a.alias)}"
 
 
 def _order_by(order: list[tuple[str, str]]) -> str:
-    return " ORDER BY " + ", ".join(f"{_q(c)} {d.upper()}" for c, d in order) if order else ""
+    return " ORDER BY " + ", ".join(f"{_col(c)} {d.upper()}" for c, d in order) if order else ""
 
 
 def compile_dsl_to_sql(
@@ -116,7 +125,8 @@ def compile_dsl_to_sql(
             out = _Rel(list(columns[step.table]), [])
         elif isinstance(step, SelectArg):
             src = rel(step.input)
-            body = f"SELECT {', '.join(_q(c) for c in step.columns)} FROM {_q(step.input)}{_order_by(src.order)}"
+            cols = [f"{_col(c)} AS {_q(c)}" if _col(c) != _q(c) else _q(c) for c in step.columns]
+            body = f"SELECT {', '.join(cols)} FROM {_q(step.input)}{_order_by(src.order)}"
             kept = src.order if all(c in step.columns for c, _ in src.order) else []
             out = _Rel(list(step.columns), kept)
         elif isinstance(step, FilterArg):
@@ -138,8 +148,9 @@ def compile_dsl_to_sql(
             out = _Rel(src.columns, src.order)
         elif isinstance(step, AggregateStepArg):
             rel(step.input)
-            select = ", ".join([*(_q(c) for c in step.group_by), *(_agg(a) for a in step.aggregates)])
-            group = f" GROUP BY {', '.join(_q(c) for c in step.group_by)}" if step.group_by else ""
+            gb_cols = [f"{_col(c)} AS {_q(c)}" if _col(c) != _q(c) else _q(c) for c in step.group_by]
+            select = ", ".join([*gb_cols, *(_agg(a) for a in step.aggregates)])
+            group = f" GROUP BY {', '.join(_col(c) for c in step.group_by)}" if step.group_by else ""
             body = f"SELECT {select} FROM {_q(step.input)}{group}"
             if step.having is not None:
                 body = f"SELECT * FROM ({body}) AS _g WHERE {_cond(step.having)}"
@@ -152,10 +163,10 @@ def compile_dsl_to_sql(
             for alias, cols, suffix in (("L", left.columns, "_left"), ("R", right.columns, "_right")):
                 for c in cols:
                     name = f"{c}{suffix}" if c in overlap else c
-                    parts.append(f"{alias}.{_q(c)} AS {_q(name)}")
+                    parts.append(f"{_col(c, alias)} AS {_q(name)}")
                     names.append(name)
             how = {"inner": "INNER", "left": "LEFT", "right": "RIGHT"}[step.how]
-            on = " AND ".join(f"L.{_q(k.left_col)} = R.{_q(k.right_col)}" for k in step.on)
+            on = " AND ".join(f"{_col(k.left_col, 'L')} = {_col(k.right_col, 'R')}" for k in step.on)
             body = f"SELECT {', '.join(parts)} FROM {_q(step.left)} AS L {how} JOIN {_q(step.right)} AS R ON {on}"
             out = _Rel(names, [])
         else:

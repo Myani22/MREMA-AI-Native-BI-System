@@ -8,7 +8,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, date
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -353,7 +353,6 @@ class Agent:
         )
         allowed = set(self.config.chart_types or SUPPORTED_CHART_TYPES)
 
-        # Быстрый путь EDIT_CHART: меняем только отображение без регенерации DSL
         if edit_context and edit_context.get("view_only"):
             orig: ChartMicrosession = edit_context["microsession"]
             title = orig.chart_spec.title or orig.question
@@ -493,8 +492,57 @@ class Agent:
                 title=item.title,
                 allowed=allowed,
             )
+
+            if spec and spec.x and re.search(r"по\s+месяц", spec.title or "", re.I):
+                col_x = table.column(spec.x)
+                if col_x and col_x.semantic_type == SemanticType.DATE:
+                    idx = [c.name for c in table.columns].index(spec.x)
+                    x_vals = [r[idx] for r in table.rows if r[idx] is not None]
+                    parsed_dates = []
+                    for v in x_vals:
+                        if hasattr(v, "year") and hasattr(v, "month") and hasattr(v, "day"):
+                            parsed_dates.append(v)
+                        elif isinstance(v, str) and len(v) >= 10:
+                            try:
+                                parsed_dates.append(date.fromisoformat(v[:10]))
+                            except ValueError:
+                                pass
+                    if len(parsed_dates) == len(x_vals) and len(x_vals) > 1:
+                        months = {(d.year, d.month) for d in parsed_dates}
+                        days = {d.day for d in parsed_dates}
+                        if len(months) == 1 and len(days) > 1:
+                            run.trace.warnings.append("заголовок обещает месяцы, данные по дням")
+                            args, dsl_warnings2 = await build_dsl(
+                                run.sql_llm,
+                                question=question,
+                                chart_type=item.chart_type,
+                                title=item.title,
+                                purpose=item.purpose + f" Указание: используй колонку «{spec.x} (месяц)» для группировки.",
+                                catalog=run.catalog,
+                                tables=tables,
+                                budget=budget,
+                                max_attempts_per_step=1,
+                            )
+                            run.trace.warnings.extend(dsl_warnings2)
+                            if args:
+                                try:
+                                    outcome = await asyncio.wait_for(
+                                        runner.run(args, ctx, max_rows=self.config.stored_rows),
+                                        self.config.tool_timeout_s,
+                                    )
+                                    table = to_result_table(outcome.rows, outcome.schema, self.config.stored_rows)
+                                    spec, note = choose_chart(
+                                        table,
+                                        requested=item.chart_type,
+                                        title=item.title,
+                                        allowed=allowed,
+                                    )
+                                except Exception:
+                                    pass
+                                    
             if spec is None:
                 spec = ChartSpec(chart_type=ChartType.TABLE, title=item.title)
+
             charts.append(
                 ChartMicrosession(
                     id=_new_id(),

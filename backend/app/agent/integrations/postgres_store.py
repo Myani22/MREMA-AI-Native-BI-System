@@ -123,6 +123,28 @@ class PostgresCatalogProvider:
             ).fetchall()
             total = int(conn.execute(text(f"SELECT count(*) FROM {source}")).scalar() or 0)
             columns = [self._column(conn, source, cname, ctype, total, originals.get(cname)) for cname, ctype in cols]
+            
+            derived = []
+            for c in columns:
+                if c.semantic_type is SemanticType.DATE:
+                    derived.append(ColumnInfo(
+                        name=f"{c.name} (месяц)",
+                        db_type="date",
+                        semantic_type=SemanticType.DATE,
+                        null_share=c.null_share,
+                        distinct_count=c.distinct_count,
+                        description=f"производная от «{c.name}»"
+                    ))
+                    derived.append(ColumnInfo(
+                        name=f"{c.name} (год)",
+                        db_type="int",
+                        semantic_type=SemanticType.NUMERIC,
+                        null_share=c.null_share,
+                        distinct_count=c.distinct_count,
+                        description=f"производная от «{c.name}»"
+                    ))
+            columns.extend(derived)
+            
             time_col = next((c for c in columns if c.semantic_type is SemanticType.DATE), None)
             tables.append(
                 TableInfo(
