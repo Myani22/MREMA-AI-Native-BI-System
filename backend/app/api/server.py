@@ -66,6 +66,8 @@ class HealthView(BaseModel):
     model: str | None
     structured_mode: str | None
     tables: int
+    backend: str | None = None
+    sql_backend: str | None = None
 
 
 def create_app(bundle: AgentBundle | None = None) -> FastAPI:
@@ -78,6 +80,11 @@ def create_app(bundle: AgentBundle | None = None) -> FastAPI:
         close = getattr(agent.llm, "aclose", None)
         if close is not None:
             await close()
+        sql_llm = getattr(agent, "sql_llm", None)
+        if sql_llm is not None and sql_llm is not agent.llm:
+            close_sql = getattr(sql_llm, "aclose", None)
+            if close_sql is not None:
+                await close_sql()
 
     app = FastAPI(title="AI-Native BI", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
@@ -90,12 +97,16 @@ def create_app(bundle: AgentBundle | None = None) -> FastAPI:
     @app.get("/api/health", response_model=HealthView)
     async def health() -> HealthView:
         config = getattr(agent.llm, "config", None)
+        sql_llm = getattr(agent, "sql_llm", None)
+        sql_config = getattr(sql_llm, "config", None)
         mode = getattr(agent.llm, "structured_mode", None)
         return HealthView(
             status="ok",
             model=getattr(config, "model", None),
             structured_mode=str(mode) if mode else None,
             tables=len((await agent.catalog_provider.get_catalog()).tables),
+            backend=getattr(config, "backend", None),
+            sql_backend=getattr(sql_config, "backend", None),
         )
 
     @app.post("/api/chat", response_model=AgentResponse)

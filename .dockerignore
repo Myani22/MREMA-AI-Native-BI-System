@@ -1,0 +1,26 @@
+#ide
+.vscode/
+.idea/
+
+
+# Python
+/.venv/
+__pycache__/
+
+.env
+.env.*
+.env_folder/
+!.env.example
+*.py[cod]
+.venv/
+
+# from tests/usage
+chart_plots/
+
+data/
+
+#git
+.git/
+.gitignore
+README.md
+LICENSE
