@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.agent.contracts import AgentResponse, Catalog, ChartType, Dashboard, ResultTable, TableInfo
 from app.agent.factory import AgentBundle, build_agent
@@ -55,6 +55,12 @@ class ChartPngRequest(BaseModel):
     data: ResultTable
 
 
+class DatabaseSyncRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    url: str = Field(min_length=1)
+    db_schema: str = Field("data", alias="schema")
+
+
 class HealthView(BaseModel):
     status: str
     model: str | None
@@ -89,7 +95,7 @@ def create_app(bundle: AgentBundle | None = None) -> FastAPI:
             status="ok",
             model=getattr(config, "model", None),
             structured_mode=str(mode) if mode else None,
-            tables = len((await agent.catalog_provider.get_catalog()).tables),
+            tables=len((await agent.catalog_provider.get_catalog()).tables),
         )
 
     @app.post("/api/chat", response_model=AgentResponse)
@@ -177,22 +183,19 @@ def create_app(bundle: AgentBundle | None = None) -> FastAPI:
             raise HTTPException(422, str(e)) from e
         return Response(content=png, media_type="image/png")
 
+    engines: dict[tuple[str, str], Any] = {}
+
     @app.post("/api/datasets/import-db")
-    async def import_db(payload: dict):
+    async def import_db(request: DatabaseSyncRequest) -> dict[str, Any]:
         from sqlalchemy import create_engine
-        from app.agent.integrations.postgres_store import (
-            PostgresCatalogProvider,
-            PostgresQueryExecutor,
-        )
-        url = payload["url"]
-        schema = payload.get("schema", "public")
-        pg_engine = create_engine(
-            url, pool_pre_ping=True, connect_args={"connect_timeout": 5}
-        )
-        provider = PostgresCatalogProvider(pg_engine, schema=schema)
-        agent.catalog_provider = provider
-        agent.executor = PostgresQueryExecutor(pg_engine)
-        catalog = await provider.get_catalog()
+
+        key = (request.url, request.db_schema)
+        if key not in engines:
+            engines[key] = create_engine(request.url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
+        bundle.attach_database(engines[key], schema=request.db_schema)
+        catalog = await agent.catalog_provider.get_catalog()
+        if bundle.sources.database_error:
+            raise HTTPException(502, f"Не удалось подключиться к базе: {bundle.sources.database_error}")
         return {"status": "ok", "tables": len(catalog.tables)}
 
     return app

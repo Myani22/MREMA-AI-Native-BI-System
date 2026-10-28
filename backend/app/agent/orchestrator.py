@@ -1,11 +1,9 @@
 from __future__ import annotations
-from .chart_planner import plan_charts, ChartPlanItem
-from .integrations.charts import SUPPORTED_CHART_TYPES
 
 import asyncio
 import logging
-import time
 import re
+import time
 import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
@@ -15,9 +13,23 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from .catalog_refs import build_args_schema, catalog_fields, check_catalog_refs, fix_catalog_refs
+from .catalog_refs import (
+    build_args_schema,
+    catalog_fields,
+    check_catalog_refs,
+    fix_catalog_refs,
+)
+from .chart_planner import plan_charts
 from .config import AgentConfig
-from .contracts.catalog import TIME_TYPES, Catalog, CatalogProvider, QueryError, QueryExecutor, SemanticType, split_column_ref
+from .contracts.catalog import (
+    TIME_TYPES,
+    Catalog,
+    CatalogProvider,
+    QueryError,
+    QueryExecutor,
+    SemanticType,
+    split_column_ref,
+)
 from .contracts.dashboard import Dashboard, DashboardStore, DashboardWidget
 from .contracts.response import (
     CHART_LABELS,
@@ -40,6 +52,7 @@ from .contracts.response import (
     ToolCallTrace,
 )
 from .contracts.tools import BaseTool, ToolContext, ToolRegistry, ToolResult, ToolStatus
+from .integrations.charts import SUPPORTED_CHART_TYPES
 from .intents import ANALYTIC_INTENTS, Intent
 from .llm.client import ChatMessage, LLMClient, LLMReply, system_msg, user_msg
 from .llm.errors import LLMError, LLMUnavailableError, StructuredOutputError
@@ -65,7 +78,7 @@ from .prompts import (
 )
 from .router import IntentDecision, IntentRouter
 from .schema_linking import render_schema, select_tables
-from .viz import alternative_chart, choose_chart
+from .viz import alternative_chart, candidates, choose_chart, mention_hint
 
 log = logging.getLogger(__name__)
 
@@ -144,13 +157,27 @@ def _title(question: str, limit: int = 90) -> str:
     q = question.strip().rstrip("?").strip()
     return q if len(q) <= limit else q[: limit - 1].rstrip() + "…"
 
+
 _MULTI_RE = re.compile(
     r"сравн|обзор|несколько|дашборд|панел|отчёт|отчет|покажи\s+всё|покажи\s+все",
     re.I,
 )
 
+
 def _looks_multi_chart(text: str) -> bool:
     return bool(_MULTI_RE.search(text))
+
+
+_TWO_AXIS_CHARTS = frozenset({ChartType.LINE, ChartType.SCATTER, ChartType.AREA})
+
+
+def _widget_intent(intent: Intent, chart_type: ChartType | None) -> Intent:
+    if intent not in ANALYTIC_INTENTS:
+        return Intent.DATA_QUESTION
+    if intent is Intent.DISTRIBUTION and chart_type in _TWO_AXIS_CHARTS:
+        return Intent.DATA_QUESTION
+    return intent
+
 
 class Agent:
     def __init__(
@@ -176,7 +203,6 @@ class Agent:
         self.config = config or AgentConfig()
         self.chart_exporter = chart_exporter
         self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-
 
     async def handle(self, session_id: str, message: str, *, emit: EventSink | None = None) -> AgentResponse:
         async with self._locks[session_id]:
@@ -207,7 +233,6 @@ class Agent:
         dashboard.refreshed_at = datetime.now(UTC)
         await self.dashboards.save(dashboard)
         return dashboard
-
 
     async def _handle(self, session_id: str, message: str, emit: EventSink | None) -> AgentResponse:
         started = time.monotonic()
@@ -299,24 +324,30 @@ class Agent:
                 decision.wants_chart or _looks_multi_chart(decision.standalone_question)
             ):
                 return await self._answer_chart_first(
-                    run, decision.standalone_question, turn, decision.intent
+                    run, decision.standalone_question, turn, decision.intent, decision.chart_type
                 )
             case _:
                 return await self._answer(run, decision, turn)
 
     async def _answer_chart_first(
-        self, run: "_Run", question: str, turn: Turn, intent: Intent
+        self, run: _Run, question: str, turn: Turn, intent: Intent, requested: ChartType | None = None
     ) -> AgentResponse:
-        """LLM сначала планирует графики, потом под каждый генерит запрос."""
         await self._status(run, "planning", "Планирую визуализации")
         allowed = set(self.config.chart_types or SUPPORTED_CHART_TYPES)
+        if requested in allowed:
+            allowed = {requested}
+        tables = select_tables(question, run.catalog, focus=run.state.focus_tables, max_tables=self.config.max_schema_tables)
         plan = await plan_charts(
-            run.llm, question, run.catalog,
+            run.llm,
+            question,
+            run.catalog,
             allowed_types=allowed,
+            tables=tables,
             max_attempts=self.config.max_structured_attempts,
-            max_tables=self.config.max_schema_tables,
             max_columns=self.config.max_schema_columns,
         )
+        if requested in allowed:
+            plan.charts = plan.charts[:1]
         blocks: list[Block] = []
         summaries: list[str] = []
         titles: list[str] = []
@@ -470,14 +501,12 @@ class Agent:
         widgets: list[DashboardWidget] = []
         skipped: list[str] = []
         for wp in plan.widgets:
-            intent = wp.intent if wp.intent in ANALYTIC_INTENTS else Intent.DATA_QUESTION
-            try:
-                ex = await self._execute(run, intent, wp.question)
-            except (_EarlyReply, StructuredOutputError) as e:
-                skipped.append(wp.title)
-                run.trace.warnings.append(f"виджет «{wp.title}» пропущен: {e}")
-                continue
-            if ex.result.status is not ToolStatus.OK or ex.result.table is None or not ex.result.table.rows:
+            intent = _widget_intent(wp.intent, wp.chart_type)
+            ex = await self._widget_execution(run, intent, wp.title, wp.question)
+            if ex is None and intent is not Intent.DATA_QUESTION:
+                intent = Intent.DATA_QUESTION
+                ex = await self._widget_execution(run, intent, wp.title, wp.question)
+            if ex is None:
                 skipped.append(wp.title)
                 continue
             chart, _ = choose_chart(
@@ -514,12 +543,22 @@ class Agent:
             DashboardBlock(dashboard_id=dashboard.id, title=dashboard.title, widget_count=len(widgets)),
         ]
         for w in widgets:
+            chart_block = None
             if w.chart and w.chart.chart_type is not ChartType.TABLE:
-                blocks.append(self._chart_block(f"{dashboard.id}-{w.id}", w.chart, w.data, None))  # type: ignore[arg-type]
-            else:
-                blocks.append(TableBlock(id=f"{dashboard.id}-{w.id}", title=w.title, data=w.data))  # type: ignore[arg-type]
+                chart_block = self._chart_block(f"{dashboard.id}-{w.id}", w.chart, w.data, None)  # type: ignore[arg-type]
+            blocks.append(chart_block or TableBlock(id=f"{dashboard.id}-{w.id}", title=w.title, data=w.data))  # type: ignore[arg-type]
         return self._respond(run, "ok", blocks)
 
+    async def _widget_execution(self, run: _Run, intent: Intent, title: str, question: str) -> _Execution | None:
+        try:
+            ex = await self._execute(run, intent, question)
+        except (_EarlyReply, StructuredOutputError) as e:
+            run.trace.warnings.append(f"виджет «{title}» ({intent.value}) не построен: {e}")
+            return None
+        if ex.result.status is not ToolStatus.OK or ex.result.table is None or not ex.result.table.rows:
+            run.trace.warnings.append(f"виджет «{title}» ({intent.value}) без данных")
+            return None
+        return ex
 
     async def _execute(self, run: _Run, intent: Intent, question: str) -> _Execution:
         tools = self.tools.for_intent(intent) or self.tools.for_intent(Intent.DATA_QUESTION)
@@ -547,6 +586,7 @@ class Agent:
             )
         if result.status is ToolStatus.ERROR:
             raise _EarlyReply("error", result.error or GENERIC_ERROR_TEXT, retryable=True)
+        result.chart_hint = mention_hint(result.table, question, result.chart_hint)
         return _Execution(tool, args, result, self._tables_used(tool, args) or tables)
 
     async def _choose_tool(self, run: _Run, tools: list[BaseTool], question: str) -> BaseTool:
@@ -578,15 +618,18 @@ class Agent:
             name=tool.name,
             description=tool.description,
             hint=tool.args_hint,
+            refs="; колонку указывай как «таблица.колонка»" if "column" in fields.values() else "",
             schema=render_schema(catalog, tables, max_columns=self.config.max_schema_columns),
         )
         content = ARGS_USER.format(question=question)
         if feedback is not None:
             content += ARGS_FEEDBACK.format(args=feedback[0].model_dump_json(), error=feedback[1])
         llm = run.sql_llm if tool.llm_role == "sql" else run.llm
+
         def _preprocess(data: dict) -> dict:
             data = fix_catalog_refs(data, fields, all_tables, all_columns)
-            return tool.preprocess_args(data, catalog)  
+            return tool.preprocess_args(data, catalog)
+
         return await generate_structured(
             llm,
             [system_msg(prompt), user_msg(content)],
@@ -632,7 +675,6 @@ class Agent:
                     used.append(v if kind == "table" else split_column_ref(v)[0])
         return list(dict.fromkeys(used))
 
-
     def _store_artifact(
         self, run: _Run, intent: Intent, question: str, execution: _Execution, chart: ChartSpec | None
     ) -> Artifact:
@@ -651,13 +693,31 @@ class Agent:
         run.state.add_artifact(artifact)
         return artifact
 
-    def _chart_block(self, block_id: str, spec: ChartSpec, data: ResultTable, note: str | None) -> ChartBlock:
-        engine_spec = None
-        if self.chart_exporter is not None:
-            try:
-                engine_spec = self.chart_exporter(spec, data)
-            except Exception:
-                log.exception("chart exporter failed for %s", spec.chart_type)
+    def _export(self, spec: ChartSpec, data: ResultTable) -> dict[str, Any] | None:
+        try:
+            return self.chart_exporter(spec, data) if self.chart_exporter is not None else None
+        except Exception:
+            log.exception("chart exporter failed for %s", spec.chart_type)
+            return None
+
+    def _chart_block(self, block_id: str, spec: ChartSpec, data: ResultTable, note: str | None) -> ChartBlock | None:
+        if self.chart_exporter is None:
+            return ChartBlock(id=block_id, spec=spec, data=data, note=note)
+        engine_spec = self._export(spec, data)
+        if engine_spec is None:
+            for alt in candidates(data, None, self.config.chart_types):
+                if alt.chart_type in (spec.chart_type, ChartType.TABLE):
+                    continue
+                alt = alt.model_copy(update={"title": spec.title})
+                engine_spec = self._export(alt, data)
+                if engine_spec is not None:
+                    reason = f"{CHART_LABELS[spec.chart_type].capitalize()} для этих данных не строится, показываю: {CHART_LABELS[alt.chart_type]}."
+                    note = f"{note} {reason}" if note else reason
+                    spec = alt
+                    break
+        if engine_spec is None:
+            log.info("no renderable chart for %s, showing table only", spec.chart_type)
+            return None
         return ChartBlock(id=block_id, spec=spec, data=data, note=note, engine_spec=engine_spec)
 
     def _result_blocks(self, artifact: Artifact, note: str | None) -> list[Block]:
@@ -666,9 +726,12 @@ class Agent:
             return []
         chart = artifact.chart
         blocks: list[Block] = []
+        chart_block = None
         if chart is not None and chart.chart_type is not ChartType.TABLE:
-            blocks.append(self._chart_block(f"{artifact.id}-chart", chart, table, note))
-        if chart is None or chart.chart_type is not ChartType.KPI:
+            chart_block = self._chart_block(f"{artifact.id}-chart", chart, table, note)
+        if chart_block is not None:
+            blocks.append(chart_block)
+        if chart_block is None or chart_block.spec.chart_type is not ChartType.KPI:
             blocks.append(TableBlock(id=f"{artifact.id}-table", title=chart.title if chart else "", data=table))
         return blocks
 

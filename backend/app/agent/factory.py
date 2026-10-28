@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from .integrations.postgres_store import PostgresCatalogProvider, PostgresQueryExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -12,6 +11,7 @@ from .integrations.basic_tools import DescribeColumnTool, OverviewTool, Relation
 from .integrations.charts import SUPPORTED_CHART_TYPES, export_chart
 from .integrations.csv_store import InMemoryCsvStore
 from .integrations.query_dsl import QueryDslTool
+from .integrations.sources import HybridCatalogProvider
 from .llm.client import LLMClient, OpenAICompatibleClient
 from .memory import InMemoryMemoryStore
 from .orchestrator import Agent
@@ -22,6 +22,13 @@ class AgentBundle:
     agent: Agent
     store: InMemoryCsvStore
     dashboards: InMemoryDashboardStore
+    sources: HybridCatalogProvider
+
+    def attach_database(self, engine, *, schema: str = "data") -> None:
+        from .integrations.postgres_store import PostgresCatalogProvider, PostgresQueryExecutor
+
+        self.sources.database = PostgresCatalogProvider(engine, schema=schema)
+        self.agent.executor = PostgresQueryExecutor(engine, schema=schema)
 
 
 def build_tools(store: InMemoryCsvStore) -> ToolRegistry:
@@ -36,48 +43,39 @@ def build_tools(store: InMemoryCsvStore) -> ToolRegistry:
     )
 
 
-def build_agent(*, config=None, llm=None, sql_llm=None, data_dir=None):
+def build_agent(
+    *,
+    config: AgentConfig | None = None,
+    llm: LLMClient | None = None,
+    sql_llm: LLMClient | None = None,
+    data_dir: str | Path | None = None,
+    database_engine=None,
+) -> AgentBundle:
     config = config or AgentConfig.from_env()
     config = replace(config, chart_types=config.chart_types or SUPPORTED_CHART_TYPES)
 
-    catalog_provider = None
-    executor = None
-    store = None
-
-    if os.getenv("DATABASE_URL"):
-        from app.db import engine  # SQLAlchemy engine
-        catalog_provider = PostgresCatalogProvider(engine)
-        executor = PostgresQueryExecutor(engine)
-        store = InMemoryCsvStore()  # fallback, но каталог берётся из PG
-    else:
-        data_dir = data_dir if data_dir is not None else os.environ.get("DATA_DIR")
-        store = InMemoryCsvStore.from_directory(data_dir) if data_dir and Path(data_dir).is_dir() else InMemoryCsvStore()
-        catalog_provider = store
+    data_dir = data_dir if data_dir is not None else os.environ.get("DATA_DIR")
+    store = InMemoryCsvStore.from_directory(data_dir) if data_dir and Path(data_dir).is_dir() else InMemoryCsvStore()
 
     llm = llm or OpenAICompatibleClient(config.llm)
     if sql_llm is None and config.sql_llm is not None:
         sql_llm = OpenAICompatibleClient(config.sql_llm)
 
     dashboards = InMemoryDashboardStore()
-    tools = build_tools(store) if store is not None else build_tools_no_store()
+    sources = HybridCatalogProvider(store)
     agent = Agent(
         llm=llm,
         sql_llm=sql_llm,
-        catalog_provider=catalog_provider,
-        executor=executor,
-        tools=tools,
+        catalog_provider=sources,
+        tools=build_tools(store),
         memory=InMemoryMemoryStore(),
         dashboards=dashboards,
         config=config,
         chart_exporter=export_chart,
     )
-    return AgentBundle(agent=agent, store=store, dashboards=dashboards)
-
-
-def build_tools_no_store() -> ToolRegistry:
-    """Когда работаем на Postgres, store не нужен — tools сами пойдут через executor."""
-    return ToolRegistry([
-        OverviewTool(), DescribeColumnTool(),
-        TopValuesTool(lambda: {}, lambda: {}),
-        RelationsTool(), QueryDslTool(lambda: {}, lambda: {}),
-    ])
+    bundle = AgentBundle(agent=agent, store=store, dashboards=dashboards, sources=sources)
+    if database_engine is None and os.getenv("DATABASE_URL"):
+        from app.db import engine as database_engine
+    if database_engine is not None:
+        bundle.attach_database(database_engine, schema=os.environ.get("DATABASE_SCHEMA", "data"))
+    return bundle

@@ -1,16 +1,36 @@
-"""Compile the agent DSL to PostgreSQL CTE SQL."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from .query_dsl import (
-    AggregateStepArg, AndCondition, Condition, DistinctArg, FilterArg, JoinArg,
-    Leaf, LimitArg, NotCondition, OrCondition, QueryArgs, SelectArg, SortArg, SourceArg,
+    AggregateStepArg,
+    AndCondition,
+    Condition,
+    DistinctArg,
+    FilterArg,
+    JoinArg,
+    Leaf,
+    LimitArg,
+    NotCondition,
+    OrCondition,
+    QueryArgs,
+    SelectArg,
+    SortArg,
+    SourceArg,
 )
+
+_CMP = {"eq": "=", "ne": "<>", "gt": ">", "lt": "<", "ge": ">=", "le": "<="}
 
 
 class DslCompileError(ValueError):
     pass
+
+
+@dataclass
+class _Rel:
+    columns: list[str]
+    order: list[tuple[str, str]]
 
 
 def _q(name: str) -> str:
@@ -22,7 +42,7 @@ def _lit(v: Any) -> str:
         return "NULL"
     if isinstance(v, bool):
         return "TRUE" if v else "FALSE"
-    if isinstance(v, (int, float)):
+    if isinstance(v, int | float):
         return repr(v)
     return "'" + str(v).replace("'", "''") + "'"
 
@@ -30,76 +50,114 @@ def _lit(v: Any) -> str:
 def _cond(c: Condition) -> str:
     if isinstance(c, Leaf):
         col = _q(c.column)
-        op = {"eq": "=", "ne": "<>", "gt": ">", "lt": "<", "ge": ">=", "le": "<="}
-        if c.cmp in op:
-            return f"{col} {op[c.cmp]} {_lit(c.value)}"
+        if c.cmp in _CMP:
+            if c.value is None:
+                return f"{col} IS NULL" if c.cmp == "eq" else f"{col} IS NOT NULL" if c.cmp == "ne" else "FALSE"
+            return f"{col} {_CMP[c.cmp]} {_lit(c.value)}"
         if c.cmp in ("in", "not_in"):
-            vals = ", ".join(_lit(v) for v in (c.values or []))
-            return f"{col} {'IN' if c.cmp == 'in' else 'NOT IN'} ({vals})"
+            values = c.values or []
+            if not values:
+                return "FALSE" if c.cmp == "in" else "TRUE"
+            return f"{col} {'IN' if c.cmp == 'in' else 'NOT IN'} ({', '.join(_lit(v) for v in values)})"
         if c.cmp == "between":
             return f"{col} BETWEEN {_lit(c.min)} AND {_lit(c.max)}"
         if c.cmp == "like":
-            return f"{col} LIKE {_lit(c.pattern)}"
+            return f"CAST({col} AS TEXT) LIKE {_lit(c.pattern)}"
         if c.cmp == "is_null":
             return f"{col} IS NULL"
         if c.cmp == "is_not_null":
             return f"{col} IS NOT NULL"
-        raise DslCompileError(f"unknown cmp {c.cmp}")
+        raise DslCompileError(f"неизвестное сравнение {c.cmp}")
     if isinstance(c, AndCondition):
         return "(" + " AND ".join(_cond(x) for x in c.all_of) + ")"
     if isinstance(c, OrCondition):
         return "(" + " OR ".join(_cond(x) for x in c.any_of) + ")"
     if isinstance(c, NotCondition):
         return "NOT (" + _cond(c.negated) + ")"
-    raise DslCompileError(f"unknown condition {type(c).__name__}")
+    raise DslCompileError(f"неизвестное условие {type(c).__name__}")
 
 
 def _agg(a) -> str:
-    col = "*" if a.column == "*" else _q(a.column)
-    return f"{a.func.upper()}({col}) AS {_q(a.alias)}"
+    if a.column == "*":
+        return f"COUNT(*) AS {_q(a.alias)}"
+    return f"{a.func.upper()}({_q(a.column)}) AS {_q(a.alias)}"
+
+
+def _order_by(order: list[tuple[str, str]]) -> str:
+    return " ORDER BY " + ", ".join(f"{_q(c)} {d.upper()}" for c, d in order) if order else ""
 
 
 def compile_dsl_to_sql(
-    args: QueryArgs, *, table_map: dict[str, str], schema: str = "data",
+    args: QueryArgs,
+    *,
+    columns: dict[str, list[str]],
+    schema: str = "data",
+    table_map: dict[str, str] | None = None,
 ) -> str:
+    table_map = table_map or {}
+    rels: dict[str, _Rel] = {}
     ctes: list[str] = []
+
+    def rel(var: str) -> _Rel:
+        if var not in rels:
+            raise DslCompileError(f"переменная {var} не определена")
+        return rels[var]
+
     for step in args.steps:
         if isinstance(step, SourceArg):
+            if step.table not in columns:
+                raise DslCompileError(f"нет таблицы {step.table}")
             phys = table_map.get(step.table, step.table)
-            ctes.append(f"{_q(step.var)} AS (SELECT * FROM {_q(schema)}.{_q(phys)})")
+            body = f"SELECT * FROM {_q(schema)}.{_q(phys)}"
+            out = _Rel(list(columns[step.table]), [])
         elif isinstance(step, SelectArg):
-            cols = ", ".join(_q(c) for c in step.columns)
-            ctes.append(f"{_q(step.var)} AS (SELECT {cols} FROM {_q(step.input)})")
+            src = rel(step.input)
+            body = f"SELECT {', '.join(_q(c) for c in step.columns)} FROM {_q(step.input)}{_order_by(src.order)}"
+            kept = src.order if all(c in step.columns for c, _ in src.order) else []
+            out = _Rel(list(step.columns), kept)
         elif isinstance(step, FilterArg):
-            ctes.append(
-                f"{_q(step.var)} AS (SELECT * FROM {_q(step.input)} WHERE {_cond(step.condition)})"
-            )
+            src = rel(step.input)
+            body = f"SELECT * FROM {_q(step.input)} WHERE {_cond(step.condition)}{_order_by(src.order)}"
+            out = _Rel(src.columns, src.order)
         elif isinstance(step, SortArg):
-            order = ", ".join(f"{_q(k.column)} {k.dir.upper()}" for k in step.by)
-            ctes.append(f"{_q(step.var)} AS (SELECT * FROM {_q(step.input)} ORDER BY {order})")
+            src = rel(step.input)
+            order = [(k.column, k.dir) for k in step.by]
+            body = f"SELECT * FROM {_q(step.input)}{_order_by(order)}"
+            out = _Rel(src.columns, order)
         elif isinstance(step, LimitArg):
-            ctes.append(f"{_q(step.var)} AS (SELECT * FROM {_q(step.input)} LIMIT {int(step.n)})")
-        elif isinstance(step, AggregateStepArg):
-            gb = ", ".join(_q(c) for c in step.group_by)
-            aggs = ", ".join(_agg(a) for a in step.aggregates)
-            sel = ", ".join(filter(None, [gb, aggs]))
-            grp = f" GROUP BY {gb}" if gb else ""
-            hav = f" HAVING {_cond(step.having)}" if step.having else ""
-            ctes.append(
-                f"{_q(step.var)} AS (SELECT {sel} FROM {_q(step.input)}{grp}{hav})"
-            )
+            src = rel(step.input)
+            body = f"SELECT * FROM {_q(step.input)}{_order_by(src.order)} LIMIT {int(step.n)}"
+            out = _Rel(src.columns, src.order)
         elif isinstance(step, DistinctArg):
-            ctes.append(f"{_q(step.var)} AS (SELECT DISTINCT * FROM {_q(step.input)})")
+            src = rel(step.input)
+            body = f"SELECT DISTINCT * FROM {_q(step.input)}{_order_by(src.order)}"
+            out = _Rel(src.columns, src.order)
+        elif isinstance(step, AggregateStepArg):
+            rel(step.input)
+            select = ", ".join([*(_q(c) for c in step.group_by), *(_agg(a) for a in step.aggregates)])
+            group = f" GROUP BY {', '.join(_q(c) for c in step.group_by)}" if step.group_by else ""
+            body = f"SELECT {select} FROM {_q(step.input)}{group}"
+            if step.having is not None:
+                body = f"SELECT * FROM ({body}) AS _g WHERE {_cond(step.having)}"
+            out = _Rel([*step.group_by, *(a.alias for a in step.aggregates)], [])
         elif isinstance(step, JoinArg):
+            left, right = rel(step.left), rel(step.right)
+            overlap = set(left.columns) & set(right.columns)
+            parts: list[str] = []
+            names: list[str] = []
+            for alias, cols, suffix in (("L", left.columns, "_left"), ("R", right.columns, "_right")):
+                for c in cols:
+                    name = f"{c}{suffix}" if c in overlap else c
+                    parts.append(f"{alias}.{_q(c)} AS {_q(name)}")
+                    names.append(name)
             how = {"inner": "INNER", "left": "LEFT", "right": "RIGHT"}[step.how]
-            on = " AND ".join(
-                f"L.{_q(k.left_col)} = R.{_q(k.right_col)}" for k in step.on
-            )
-            # как в QueryEngine: коллизии получают суффиксы _left/_right
-            ctes.append(
-                f"{_q(step.var)} AS (SELECT L.*, R.* FROM {_q(step.left)} L "
-                f"{how} JOIN {_q(step.right)} R ON {on})"
-            )
+            on = " AND ".join(f"L.{_q(k.left_col)} = R.{_q(k.right_col)}" for k in step.on)
+            body = f"SELECT {', '.join(parts)} FROM {_q(step.left)} AS L {how} JOIN {_q(step.right)} AS R ON {on}"
+            out = _Rel(names, [])
         else:
-            raise DslCompileError(f"unsupported step {type(step).__name__}")
-    return "WITH " + ",\n".join(ctes) + f"\nSELECT * FROM {_q(args.output)}"
+            raise DslCompileError(f"шаг {type(step).__name__} не поддерживается")
+        rels[step.var] = out
+        ctes.append(f"{_q(step.var)} AS ({body})")
+
+    final = rel(args.output)
+    return "WITH " + ",\n".join(ctes) + f"\nSELECT * FROM {_q(args.output)}{_order_by(final.order)}"

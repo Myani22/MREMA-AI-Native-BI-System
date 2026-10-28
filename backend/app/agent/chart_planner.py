@@ -43,16 +43,16 @@ async def plan_charts(
     catalog: Catalog,
     *,
     allowed_types: set[ChartType],
+    tables: list[str] | None = None,
     max_attempts: int = 3,
     max_tables: int = 3,
     max_columns: int = 60,
 ) -> ChartPlan:
-    table_names = [t.name for t in catalog.tables][:max_tables]
+    table_names = tables or [t.name for t in catalog.tables][:max_tables]
     schema_doc = render_schema(catalog, table_names, max_columns=max_columns)
     prompt = CHART_PLANNER_SYSTEM.format(schema=schema_doc)
 
     schema = model_schema(ChartPlan)
-    # Ограничиваем enum тем, что реально умеет рендерер
     schema["properties"]["charts"]["items"]["properties"]["chart_type"] = {
         "type": "string",
         "enum": sorted(t.value for t in allowed_types),

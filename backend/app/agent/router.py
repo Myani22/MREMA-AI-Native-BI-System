@@ -34,6 +34,10 @@ _CHART_WORDS: list[tuple[re.Pattern[str], ChartType]] = [
     (re.compile(r"теплов|хитмап|heatmap", re.I), ChartType.HEATMAP),
     (re.compile(r"(в\s+виде|как)\s+таблиц|таблицей|табличк", re.I), ChartType.TABLE),
 ]
+_DASHBOARD_RE = re.compile(
+    r"дашборд|панел[ьиейя]|dashboard|отч[её]т|нескольк\w*\s+(график|диаграмм|виджет)|набор\w*\s+график", re.I
+)
+_NON_DISTRIBUTION_CHARTS = frozenset({ChartType.LINE, ChartType.SCATTER, ChartType.AREA})
 _CHANGE_VIEW_RE = re.compile(r"друг\w*\s+(вид|форм|тип|график|диаграмм)|по-?другому|\bиначе\b", re.I)
 _SHORT_VIEW_WORDS = 4
 _FOLLOW_UP_RE = re.compile(r"подробн|детальн|больше|ещё|еще|раскрой|поясни|объясни|расскажи", re.I)
@@ -50,6 +54,19 @@ _WRITE_RE = re.compile(
 
 def detect_chart_type(text: str) -> ChartType | None:
     return next((t for pattern, t in _CHART_WORDS if pattern.search(text)), None)
+
+
+def wants_dashboard(text: str) -> bool:
+    return bool(_DASHBOARD_RE.search(text))
+
+
+def allowed_intents(message: str, allowed: list[Intent]) -> list[Intent]:
+    banned: set[Intent] = set()
+    if not wants_dashboard(message):
+        banned.add(Intent.CREATE_DASHBOARD)
+    if detect_chart_type(message) in _NON_DISTRIBUTION_CHARTS:
+        banned.add(Intent.DISTRIBUTION)
+    return [i for i in allowed if i not in banned] or allowed
 
 
 def _point_number(text: str) -> int | None:
@@ -93,6 +110,15 @@ def route_by_rules(message: str, state: SessionState) -> IntentDecision | None:
     return None
 
 
+def _coerce_intent(data: object, allowed: list[Intent]) -> object:
+    if not isinstance(data, dict) or data.get("intent") in allowed:
+        return data
+    redirected = {Intent.CREATE_DASHBOARD.value, Intent.DISTRIBUTION.value}
+    if data.get("intent") not in redirected or Intent.DATA_QUESTION not in allowed:
+        return data
+    return {**data, "intent": Intent.DATA_QUESTION.value}
+
+
 class IntentRouter:
     def __init__(self, llm: LLMClient, *, history_turns: int = 4, max_attempts: int = 3):
         self.llm = llm
@@ -108,7 +134,7 @@ class IntentRouter:
     async def classify(
         self, message: str, state: SessionState, catalog: Catalog, *, allowed: list[Intent] | None = None
     ) -> IntentDecision:
-        allowed = allowed or list(Intent)
+        allowed = allowed_intents(message, allowed or list(Intent))
         if state.last_artifact() is None:
             allowed = [i for i in allowed if i is not Intent.CHANGE_VIEW]
         schema = model_schema(IntentDecision)
@@ -124,6 +150,7 @@ class IntentRouter:
             schema=schema,
             schema_name="intent_decision",
             max_attempts=self.max_attempts,
+            preprocess=lambda data: _coerce_intent(data, allowed),
             validate=lambda d: [] if d.intent in allowed else [f"intent должен быть одним из: {', '.join(allowed)}"],
         )
         explicit = detect_chart_type(message)

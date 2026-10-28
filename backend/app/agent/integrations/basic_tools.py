@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-import asyncio
+import logging
 from collections.abc import Callable
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.query_system import QueryEngine
-
 from ..contracts.catalog import TIME_TYPES, Catalog, SemanticType, split_column_ref
 from ..contracts.response import ChartType, ResultTable, TableColumn
 from ..contracts.tools import BaseTool, ChartHint, ColumnField, TableField, ToolContext, ToolResult, ToolStatus
 from ..intents import Intent
-from .query_dsl import to_result_table
+from .dsl_exec import DslRunError, DslRunner
+from .query_dsl import QueryArgs, to_result_table
+
+log = logging.getLogger(__name__)
 
 _TYPE_LABELS = {
     SemanticType.ID: "идентификатор",
@@ -68,7 +69,7 @@ class OverviewTool(BaseTool):
             ],
             rows=rows,
         )
-        return ToolResult(facts=facts, table=table, summary_text=summary, chart_hint=ChartHint(kind="comparison", x="Таблица", y=["Строк"]))
+        return ToolResult(facts=facts, table=table, summary_text=summary, chart_hint=ChartHint(kind="comparison", x="Таблица", y=["Строк"], preferred=ChartType.TABLE))
 
 
 class ColumnArgs(BaseModel):
@@ -130,9 +131,7 @@ class TopValuesTool(BaseTool):
     args_model = TopValuesArgs
 
     def __init__(self, schema: Callable[[], dict[str, dict[str, str]]], sources: Callable[[], dict[str, Any]]):
-        self._schema = schema
-        self._sources = sources
-        self.engine = QueryEngine()
+        self.runner = DslRunner(schema, sources)
 
     async def run(self, args: TopValuesArgs, ctx: ToolContext) -> ToolResult:
         resolved = ctx.catalog.resolve_column(args.column)
@@ -152,17 +151,19 @@ class TopValuesTool(BaseTool):
         if not is_time:
             steps.append({"var": "L", "op": "limit", "input": "S", "n": args.limit})
         payload = {"steps": steps, "output": steps[-1]["var"]}
-        query = self.engine.from_dict(payload)
-        validation = self.engine.validate(query, self._schema())
-        if not validation.ok:
-            return ToolResult(status=ToolStatus.ERROR, error="Не удалось посчитать распределение для этого поля.")
-        rows = (await asyncio.to_thread(self.engine.execute, query, self._sources())).to_dicts()
+        try:
+            outcome = await self.runner.run(QueryArgs.model_validate(payload), ctx, max_rows=500)
+        except DslRunError as e:
+            log.warning("top_values failed for %s: %s", args.column, e.message)
+            message = e.message if e.status is ToolStatus.ERROR else "Не удалось посчитать распределение для этого поля."
+            return ToolResult(status=ToolStatus.ERROR, error=message)
+        rows = outcome.rows
         if not rows:
             return ToolResult(status=ToolStatus.EMPTY, summary_text=f"В поле «{col.label}» нет заполненных значений.")
         non_null = round(table_info.row_count * (1 - (col.null_share or 0)))
         for r in rows:
             r["Доля, %"] = round(r["Количество"] / non_null * 100, 1) if non_null else None
-        schema = {**(validation.output_schema or {}), "Доля, %": "float"}
+        schema = {**outcome.schema, "Доля, %": "float"}
         table = to_result_table(rows, schema, 500)
         top = rows[0] if not is_time else max(rows, key=lambda r: r["Количество"])
         top_value = table.rows[rows.index(top)][0]

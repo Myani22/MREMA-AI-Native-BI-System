@@ -11,23 +11,57 @@ from app.db import SessionLocal
 from app.models import Dataset
 
 
+def _fit_identifier(name: str, limit: int = 63) -> str:
+    while len(name.encode("utf-8")) > limit:
+        name = name[:-1]
+    return name
+
+
 def safe_column_name(value: Any, used: set[str]) -> str:
-    # Normalize headers before creating SQL columns. Original names remain in profile.
     name = str(value).strip().lower()
-    name = re.sub(r"[^a-zA-Z0-9_]+", "_", name).strip("_")
+    name = re.sub(r"[^\w]+", "_", name).strip("_")
     if not name:
         name = "column"
     if name[0].isdigit():
         name = f"col_{name}"
-    name = name[:50]
+    name = _fit_identifier(name, 55)
     candidate = name
     suffix = 2
     while candidate in used:
         tail = f"_{suffix}"
-        candidate = f"{name[:63-len(tail)]}{tail}"
+        candidate = _fit_identifier(name, 63 - len(tail)) + tail
         suffix += 1
     used.add(candidate)
     return candidate
+
+
+_DATE_FORMATS = (
+    (re.compile(r"^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$"), None),
+    (re.compile(r"^\d{2}\.\d{2}\.\d{4}$"), "%d.%m.%Y"),
+    (re.compile(r"^\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}(:\d{2})?$"), "mixed"),
+)
+
+
+def _parse_dates(df: pd.DataFrame, min_share: float = 0.95) -> pd.DataFrame:
+    for column in df.columns:
+        series = df[column]
+        if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+            continue
+        values = series.dropna().astype(str).str.strip()
+        if values.empty:
+            continue
+        sample = values.head(200)
+        for pattern, fmt in _DATE_FORMATS:
+            if sample.str.match(pattern).mean() < min_share:
+                continue
+            if fmt == "mixed":
+                parsed = pd.to_datetime(series, errors="coerce", dayfirst=True, format="mixed")
+            else:
+                parsed = pd.to_datetime(series, errors="coerce", format=fmt)
+            if parsed.notna().sum() >= min_share * len(values):
+                df[column] = parsed
+            break
+    return df
 
 
 def _profile_frame(df: pd.DataFrame, original_headers: list[str]) -> list[dict]:
@@ -96,6 +130,7 @@ def import_csv_bytes(content: bytes, filename: str, engine: Engine) -> dict:
     used: set[str] = set()
     new_headers = [safe_column_name(c, used) for c in original_headers]
     df.columns = new_headers
+    df = _parse_dates(df)
 
     table_name = f"dataset_{uuid.uuid4().hex[:20]}"
     try:

@@ -218,7 +218,12 @@ for msg_idx, msg in enumerate(st.session_state.messages):
                         df = pd.DataFrame(block["data"]["rows"], columns=cols)
                         st.dataframe(df)
                         
+                    elif btype == "chart" and not block.get("engine_spec"):
+                        if block.get("note"):
+                            st.caption(block["note"])
                     elif btype == "chart":
+                        if block.get("note"):
+                            st.caption(block["note"])
                         with st.spinner("Генерация графика..."):
                             try:
                                 png_resp = requests.post(
