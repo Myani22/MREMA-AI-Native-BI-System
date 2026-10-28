@@ -126,20 +126,28 @@ with st.sidebar:
             if success_count > 0:
                 st.success(f"Загружено файлов: {success_count} из {len(uploaded_files)}")
                 
-                if "базу данных" in upload_mode and DB_URL:
-                    with st.spinner("Автоматическая синхронизация БД..."):
-                        current_schema = st.session_state.get("db_schema_input", "data")
-                        payload = {"url": DB_URL, "schema": current_schema}
-                        
-                        try:
-                            sync_resp = requests.post(f"{API_URL}/datasets/import-db", json=payload, timeout=30)
-                            if sync_resp.status_code == 200:
-                                sync_data = sync_resp.json()
-                                st.success(f"БД обновлена! Всего таблиц: {sync_data.get('tables', 0)}")
-                            else:
-                                st.warning(f"Файлы загружены, но авто-синхронизация выдала ошибку (Код {sync_resp.status_code})")
-                        except Exception as e:
-                            st.warning(f"Файлы загружены, но авто-синхронизация не удалась: {e}")
+                if "базу данных" in upload_mode:
+                    if DB_URL is None:
+                        st.warning("Файлы в БД загружены, но DATABASE_URL не задан в env фронта — автоматическая синхронизация пропущена. Откройте отладку и синхронизируйте вручную (или задайте DATABASE_URL).")
+                    else:
+                        with st.spinner("Автоматическая синхронизация БД..."):
+                            current_schema = st.session_state.get("db_schema_input", "data")
+                            payload = {"url": DB_URL, "schema": current_schema}
+                            
+                            try:
+                                sync_resp = requests.post(f"{API_URL}/datasets/import-db", json=payload, timeout=30)
+                                if sync_resp.status_code == 200:
+                                    sync_data = sync_resp.json()
+                                    st.success(f"БД обновлена! Всего таблиц: {sync_data.get('tables', 0)}")
+                                else:
+                                    error_text = sync_resp.text[:200]
+                                    try:
+                                        error_text = sync_resp.json().get("detail", error_text)
+                                    except Exception:
+                                        pass
+                                    st.warning(f"Ошибка синхронизации (Код {sync_resp.status_code}): {error_text}")
+                            except Exception as e:
+                                st.warning(f"Файлы загружены, но авто-синхронизация не удалась: {e}")
                             
     if debug_mode:
         st.divider()
@@ -261,15 +269,30 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
                     })
                     st.rerun()
                 else:
-                    st.error(f"Ошибка сервера (Код {resp.status_code})")
-                    if debug_mode:
-                        with st.expander("Trace ошибки"):
-                            try:
-                                st.json(resp.json())
-                            except Exception:
-                                st.text(resp.text)
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "raw_data": {
+                            "status": "error",
+                            "blocks": [{"type": "error", "message": f"Ошибка сервера (Код {resp.status_code})", "retryable": True}]
+                        }
+                    })
+                    st.rerun()
                                 
             except requests.exceptions.Timeout:
-                st.error(f"Время ожидания ответа превышено (таймаут {TIMEOUT_CHAT}). Попробуйте еще раз.")
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "raw_data": {
+                        "status": "error",
+                        "blocks": [{"type": "error", "message": f"Время ожидания ответа превышено (таймаут {TIMEOUT_CHAT}). Попробуйте еще раз.", "retryable": True}]
+                    }
+                })
+                st.rerun()
             except requests.exceptions.RequestException as e:
-                st.error(f"Ошибка соединения с сервером: {e}")
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "raw_data": {
+                        "status": "error",
+                        "blocks": [{"type": "error", "message": f"Ошибка соединения с сервером: {e}", "retryable": True}]
+                    }
+                })
+                st.rerun()

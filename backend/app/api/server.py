@@ -113,6 +113,20 @@ def create_app(bundle: AgentBundle | None = None) -> FastAPI:
         async def run() -> None:
             try:
                 await agent.handle(session_id, request.message, emit=emit)
+            except BaseException as e:
+                log.exception("chat_stream agent.handle failed")
+                from app.agent.prompts import GENERIC_ERROR_TEXT
+                from app.agent.contracts import ErrorBlock, AgentResponse, DoneEvent
+                err_resp = AgentResponse(
+                    session_id=session_id,
+                    turn_id=uuid.uuid4().hex[:12],
+                    status="error",
+                    blocks=[ErrorBlock(message=GENERIC_ERROR_TEXT, retryable=True)],
+                )
+                try:
+                    await emit(DoneEvent(response=err_resp))
+                except BaseException:
+                    pass
             finally:
                 await queue.put(None)
 
@@ -188,10 +202,14 @@ def create_app(bundle: AgentBundle | None = None) -> FastAPI:
     @app.post("/api/datasets/import-db")
     async def import_db(request: DatabaseSyncRequest) -> dict[str, Any]:
         from sqlalchemy import create_engine
+        from sqlalchemy.exc import ArgumentError
 
         key = (request.url, request.db_schema)
         if key not in engines:
-            engines[key] = create_engine(request.url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
+            try:
+                engines[key] = create_engine(request.url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
+            except (ArgumentError, ModuleNotFoundError, ImportError) as e:
+                raise HTTPException(422, f"Некорректный DATABASE_URL: {str(e).splitlines()[0][:200]}")
         bundle.attach_database(engines[key], schema=request.db_schema)
         catalog = await agent.catalog_provider.get_catalog()
         if bundle.sources.database_error:

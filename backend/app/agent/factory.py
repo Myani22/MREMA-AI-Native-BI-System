@@ -12,7 +12,8 @@ from .integrations.charts import SUPPORTED_CHART_TYPES, export_chart
 from .integrations.csv_store import InMemoryCsvStore
 from .integrations.query_dsl import QueryDslTool
 from .integrations.sources import HybridCatalogProvider
-from .llm.client import LLMClient, OpenAICompatibleClient
+from .llm.client import LLMClient
+from .llm.factory import LLMFactory
 from .memory import InMemoryMemoryStore
 from .orchestrator import Agent
 
@@ -57,9 +58,9 @@ def build_agent(
     data_dir = data_dir if data_dir is not None else os.environ.get("DATA_DIR")
     store = InMemoryCsvStore.from_directory(data_dir) if data_dir and Path(data_dir).is_dir() else InMemoryCsvStore()
 
-    llm = llm or OpenAICompatibleClient(config.llm)
+    llm = llm or LLMFactory.client(config.llm)
     if sql_llm is None and config.sql_llm is not None:
-        sql_llm = OpenAICompatibleClient(config.sql_llm)
+        sql_llm = LLMFactory.client(config.sql_llm)
 
     dashboards = InMemoryDashboardStore()
     sources = HybridCatalogProvider(store)
