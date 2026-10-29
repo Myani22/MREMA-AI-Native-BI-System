@@ -70,6 +70,10 @@ from .prompts import (
 from .router import IntentDecision, IntentRouter
 from .schema_linking import select_tables
 from .viz import alternative_chart, candidates, choose_chart
+from .integrations.dsl_edit import (
+    apply_limit_to_dsl, apply_sort_to_dsl,
+    detect_limit_request, detect_sort_request, resolve_column_name,
+)
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +84,17 @@ _DASHBOARD_HINT_RE = re.compile(
     r"дашборд|панел[ьиейя]|dashboard|нескольк\w*\s+(график|диаграмм|виджет)", re.I
 )
 
+_DATA_CHANGE_RE = re.compile(
+    r"\b(?:за|в|после|до|с)\s+\d{4}\b"
+    r"|\b(?:только|кроме|без|где|у котор\w*|для тех)\b"
+    r"|\b(?:добав|убер|сним|исключ|фильтр)"
+    r"|\b(?:месяц|квартал|год|январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)",
+    re.I,
+)
+
+
+def _question_has_data_change(question: str) -> bool:
+    return bool(_DATA_CHANGE_RE.search(question))
 
 class FailureExplanation(BaseModel):
     message: str
@@ -430,8 +445,34 @@ class Agent:
                 skipped.append((item.title, "исчерпан бюджет ошибок"))
                 continue
 
-            if edit_context and item.reuse_original_dsl and edit_context.get("original_dsl"):
-                args = QueryArgs.model_validate(edit_context["original_dsl"])
+            # Страховка: если правка явно презентационная, а план требует пересобрать DSL —
+            # не доверяем модели, переиспользуем существующий DSL.
+            reuse = item.reuse_original_dsl
+            if (
+                not reuse
+                and edit_context
+                and edit_context.get("original_dsl")
+                and (detect_sort_request(question) or detect_limit_request(question))
+                and not _question_has_data_change(question)
+            ):
+                reuse = True
+                run.trace.warnings.append(
+                    "презентационная правка при reuse_original_dsl=false → форсируем reuse DSL"
+                )
+
+            if edit_context and reuse and edit_context.get("original_dsl"):
+                original = edit_context["original_dsl"]
+                try:
+                    sort_req = detect_sort_request(question)
+                    if sort_req:
+                        col = resolve_column_name(original, sort_req[0])
+                        original = apply_sort_to_dsl(original, col, sort_req[1])
+                    limit_n = detect_limit_request(question)
+                    if limit_n:
+                        original = apply_limit_to_dsl(original, limit_n)
+                except Exception as e:
+                    run.trace.warnings.append(f"presentation-правка не применена: {e}")
+                args = QueryArgs.model_validate(original)
                 dsl_warnings: list[str] = []
             else:
                 await self._status(run, "planning", f"Собираю запрос: {item.title}")
@@ -446,6 +487,7 @@ class Agent:
                         tables=tables,
                         budget=budget,
                         max_attempts_per_step=self.config.per_step_error_budget,
+                        original_dsl=(edit_context or {}).get("original_dsl"),
                     )
                     run.trace.warnings.extend(dsl_warnings)
                 except Exception as e:
@@ -735,8 +777,22 @@ class Agent:
     async def _explain_failure(
         self, run: _Run, question: str, skipped: list[tuple[str, str]]
     ) -> tuple[str, list[str]]:
-        failures_str = "; ".join(f"{t} ({r})" for t, r in skipped) or "не удалось собрать запрос"
-        return f"Не удалось построить: {failures_str}", self._examples(run.catalog)[:3]
+        log.warning("Не удалось построить графики: %s", skipped)
+        # Очищаем технические подробности для пользователя
+        clean_errors = []
+        for title, err in skipped:
+            if "модель повторила" in err:
+                clean_errors.append("не удалось подобрать правильный запрос к данным")
+            elif "тип не подходит" in err:
+                clean_errors.append("в данных неверный тип поля (например, текст вместо чисел)")
+            else:
+                clean_errors.append("внутренняя ошибка построения")
+                
+        reason = clean_errors[0] if clean_errors else "неизвестная ошибка"
+        return (
+            f"К сожалению, не удалось построить график по этому запросу ({reason}). Попробуйте переформулировать вопрос или выбрать другие поля.", 
+            self._examples(run.catalog)[:3]
+        )
 
     # async def _explain_failure(
     #     self, run: _Run, question: str, skipped: list[tuple[str, str]]

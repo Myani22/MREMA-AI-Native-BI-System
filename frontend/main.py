@@ -80,10 +80,11 @@ def fetch_available_tables():
     try:
         cat_resp = requests.get(f"{API_URL}/catalog", timeout=3)
         if cat_resp.status_code == 200:
-            return [t["name"] for t in cat_resp.json().get("tables", [])]
+            tables = cat_resp.json().get("tables", [])
+            return {t["name"]: (t.get("display_name") or t["name"]) for t in tables}
     except Exception:
         pass
-    return []
+    return {}
 
 if "available_tables" not in st.session_state:
     st.session_state.available_tables = fetch_available_tables()
@@ -271,8 +272,9 @@ with col_refresh:
 with col_select:
     selected_tables = st.multiselect(
         "Поиск только в этих таблицах:",
-        options=st.session_state.available_tables,
-        default=st.session_state.get("selected_tables", st.session_state.available_tables),
+        options=list(st.session_state.available_tables.keys()),
+        default=st.session_state.get("selected_tables", list(st.session_state.available_tables.keys())),
+        format_func=lambda x: st.session_state.available_tables.get(x, x),
         key="selected_tables"
     )
 

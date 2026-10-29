@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from app.query_system import QueryEngine
 
@@ -42,6 +43,8 @@ def _messages(
     catalog: Catalog,
     tables: list[str],
     feedback: tuple[QueryArgs | None, str] | None,
+    *,
+    original_dsl: dict[str, Any] | None = None,
 ) -> list[ChatMessage]:
     type_key = "card" if chart_type is ChartType.KPI else chart_type.value
     example_dict = DSL_EXAMPLES_BY_TYPE.get(type_key, DSL_EXAMPLES_BY_TYPE["bar"])
@@ -54,6 +57,18 @@ def _messages(
         example_json=json.dumps(example_dict, ensure_ascii=False),
     )
     user_content = f"Заголовок графика: «{title}».\nВопрос: {question}\nНазначение: {purpose or title}"
+    if original_dsl is not None:
+        user_content += (
+            "\n\nПредыдущая версия DSL (её нужно изменить, а НЕ переписать заново):\n"
+            f"```json\n{json.dumps(original_dsl, ensure_ascii=False, indent=2)}\n```\n\n"
+            "ЖЁСТКИЕ ПРАВИЛА ПРИ РЕДАКТИРОВАНИИ:\n"
+            "1. СОХРАНИ все шаги source, join, filter, aggregate из предыдущей версии, "
+            "если пользователь явно не попросил их снять или изменить.\n"
+            "2. Если меняется сортировка/лимит/тип графика — это НЕ повод удалять filter.\n"
+            "3. Если меняется условие фильтрации — замени существующий filter, "
+            "не удаляй его целиком.\n"
+            "4. Если пользователь просит удалить фильтр — только тогда не включай filter.\n"
+        )
     if feedback is not None:
         prev_args, err_text = feedback
         prev_json = (
@@ -76,6 +91,7 @@ async def build_dsl(
     tables: list[str],
     budget: ErrorBudget,
     max_attempts_per_step: int = 2,
+    original_dsl: dict[str, Any] | None = None, 
 ) -> tuple[QueryArgs | None, list[str]]:
     """LLM #3 + repair-loop. Возвращает (QueryArgs | None, warnings)."""
     warnings: list[str] = []
@@ -88,7 +104,7 @@ async def build_dsl(
             warnings.append(f"{title}: бюджет исчерпан")
             return None, warnings
 
-        messages = _messages(question, chart_type, title, purpose, catalog, tables, feedback)
+        messages = _messages(question, chart_type, title, purpose, catalog, tables, feedback, original_dsl=original_dsl)
         prompt_text = "\n".join(m.content for m in messages)
 
         try:

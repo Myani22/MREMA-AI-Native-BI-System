@@ -127,6 +127,30 @@ def _json_scalar(value):
         return value.isoformat()
     return value
 
+def _parse_floats(df: pd.DataFrame) -> pd.DataFrame:
+    for column in df.columns:
+        series = df[column]
+        if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+            continue
+        
+        # Берем сэмпл для проверки
+        sample = series.dropna().astype(str).str.strip()
+        if sample.empty:
+            continue
+            
+        # Проверяем, похожи ли значения на числа с запятой или пробелами
+        is_numeric = sample.str.match(r"^-?\d{1,3}(?:[  ]\d{3})*(?:[.,]\d+)?$|^-?\d+(?:[.,]\d+)?$")
+        if is_numeric.mean() >= 0.95:
+            # Убираем пробелы, меняем запятую на точку и конвертируем
+            df[column] = pd.to_numeric(
+                series.astype(str)
+                .str.replace(" ", "", regex=False)
+                .str.replace("\u00A0", "", regex=False)
+                .str.replace(",", ".", regex=False)
+                .str.strip(),
+                errors="coerce"
+            )
+    return df
 
 def import_csv_bytes(content: bytes, filename: str, engine: Engine) -> dict:
     delimiter = _detect_delimiter(content)
@@ -154,6 +178,7 @@ def import_csv_bytes(content: bytes, filename: str, engine: Engine) -> dict:
     new_headers = [safe_column_name(c, used) for c in original_headers]
     df.columns = new_headers
     df = _parse_dates(df)
+    df = _parse_floats(df)
 
     table_name = f"dataset_{uuid.uuid4().hex[:20]}"
     try:

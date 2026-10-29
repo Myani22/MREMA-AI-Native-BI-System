@@ -73,8 +73,14 @@ def validate_chart_pipeline(args: QueryArgs, *, chart_type: str) -> list[str]:
             source_vars.add(step.var)
         elif isinstance(step, JoinArg):
             if step.left not in source_vars or step.right not in source_vars:
+                non_source = sorted(
+                    {step.left, step.right} - source_vars
+                )
                 errors.append(
-                    f"шаг {i}: join должен соединять переменные исходных source до фильтрации"
+                    f"шаг {i}: join ссылается на {non_source}, но это не source. "
+                    f"Порядок должен быть: source, source, join, затем filter и aggregate. "
+                    f"ПЕРЕСТАВЬ join сразу после второго source. "
+                    f"НЕ УДАЛЯЙ существующие filter/aggregate — они должны остаться ниже join."
                 )
         elif isinstance(step, AggregateStepArg):
             agg_step = step

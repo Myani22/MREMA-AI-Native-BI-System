@@ -166,6 +166,7 @@ DSL_SYSTEM = """Собери DSL для графика {chart_type}.
 Жёсткие ограничения:
 - Только op-ы: source, filter, join, aggregate, sort, limit. НЕЛЬЗЯ select, distinct.
 - Порядок: source(+source+join) → filter → aggregate → sort → limit.
+- **ВАЖНО ПРО JOIN:** Если в схеме выше присутствует только ОДНА таблица, ТЕБЕ СТРОГО ЗАПРЕЩЕНО использовать шаг join. Join применяется только для соединения ДВУХ РАЗНЫХ таблиц.
 - filter — только до aggregate. Для post-filter используй having внутри aggregate.
 - aggregate — ровно один. group_by = колонки X (+ series). aggregates = колонки Y (доступны: count, count_distinct, sum, avg, min, max).
 - alias — по-русски и отражает смысл агрегата:
