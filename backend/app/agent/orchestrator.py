@@ -304,7 +304,7 @@ class Agent:
             "original_question": chart_micro.question,
             "original_chart_type": chart_micro.chart_type.value,
             "original_dsl": chart_micro.chart_args,
-            "view_only": run.trace.routed_by == "rules" or decision.chart_type is not None,
+            "view_only": run.trace.routed_by == "rules",
         }
 
     async def _overview_pipeline(self, run: _Run, decision: IntentDecision, turn: Turn) -> AgentResponse:

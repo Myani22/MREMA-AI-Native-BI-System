@@ -44,7 +44,7 @@ _CHANGE_VIEW_RE = re.compile(
     re.I,
 )
 _SHORT_VIEW_WORDS = 4
-_FOLLOW_UP_RE = re.compile(r"подробн|детальн|больше|ещё|еще|раскрой|поясни|объясни|расскажи", re.I)
+_FOLLOW_UP_RE = re.compile(r"подробн|детальн|раскрой|поясни|объясни|расскажи", re.I)
 _POINT_RE = re.compile(
     r"(?:пункт\w*|п\.)\s*(?:№\s*)?(?P<after>\d+|[а-яё]+)|(?P<before>\d+|(?:перв|втор|трет|четв|пят|шест)[а-яё]*)(?:-?[а-яё]{1,3})?\s+пункт",
     re.I,

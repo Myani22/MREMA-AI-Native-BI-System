@@ -15,5 +15,6 @@ __pycache__/
 
 # from tests/usage
 chart_plots/
+.pytest_cache/
 
 data/
