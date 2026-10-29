@@ -164,9 +164,9 @@ class Agent:
             return dsl_tool.runner
         return DslRunner(lambda: {}, lambda: {})
 
-    async def handle(self, session_id: str, message: str, *, emit: EventSink | None = None) -> AgentResponse:
+    async def handle(self, session_id: str, message: str, tables: list[str] | None = None, *, emit: EventSink | None = None) -> AgentResponse:
         async with self._locks[session_id]:
-            return await self._handle(session_id, message, emit)
+            return await self._handle(session_id, message, tables, emit)
 
     async def refresh_dashboard(self, dashboard_id: str) -> Dashboard | None:
         if self.dashboards is None:
@@ -193,7 +193,7 @@ class Agent:
         await self.dashboards.save(dashboard)
         return dashboard
 
-    async def _handle(self, session_id: str, message: str, emit: EventSink | None) -> AgentResponse:
+    async def _handle(self, session_id: str, message: str, tables: list[str] | None, emit: EventSink | None) -> AgentResponse:
         started = time.monotonic()
         trace = AgentTrace()
         state = await self.memory.load(session_id)
@@ -208,7 +208,7 @@ class Agent:
         )
         turn = Turn(id=run.turn_id, user_message=message)
         try:
-            response = await self._dispatch(run, message, turn)
+            response = await self._dispatch(run, message, turn, tables)
         except _EarlyReply as e:
             response = self._early(run, e)
         except LLMUnavailableError as e:
@@ -241,9 +241,12 @@ class Agent:
             await emit(DoneEvent(response=response))
         return response
 
-    async def _dispatch(self, run: _Run, message: str, turn: Turn) -> AgentResponse:
+    async def _dispatch(self, run: _Run, message: str, turn: Turn, tables: list[str] | None = None) -> AgentResponse:
         await self._status(run, "routing", "Разбираю вопрос")
         run.catalog = await self.catalog_provider.get_catalog()
+        if tables:
+            filtered_tables = [t for t in run.catalog.tables if t.name in tables]
+            run.catalog = run.catalog.model_copy(update={"tables": filtered_tables})   
         router = IntentRouter(
             run.llm,
             history_turns=self.config.history_turns,
