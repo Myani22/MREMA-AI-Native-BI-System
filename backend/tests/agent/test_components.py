@@ -1,10 +1,10 @@
 from app.agent.catalog_refs import build_args_schema, catalog_fields, check_catalog_refs, fix_catalog_refs
 from app.agent.contracts import ChartType, ResultTable, SemanticType, TableColumn
+from app.agent.contracts.response import ChartSpec
 from app.agent.intents import Intent
-from app.agent.memory import Artifact, SessionState, Turn
+from app.agent.memory import ChartMicrosession, SessionState, Turn
 from app.agent.narrator import ungrounded_numbers
 from app.agent.router import detect_chart_type, route_by_rules
-from app.agent.contracts.tools import ToolResult
 from app.agent.viz import alternative_chart, choose_chart
 from tests.agent.fakes import CITY_TABLE, SqlArgs, make_catalog
 
@@ -14,7 +14,8 @@ def _table(*cols: tuple[str, SemanticType], rows: list[list]) -> ResultTable:
 
 
 def test_time_series_becomes_line():
-    t = _table(("Месяц", SemanticType.DATE), ("Выручка", SemanticType.NUMERIC), rows=[["2024-10", 1], ["2024-11", 2]])
+    t = _table(("Месяц", SemanticType.DATE), ("Выручка", SemanticType.NUMERIC),
+               rows=[["2024-10", 1], ["2024-11", 2]])
     spec, note = choose_chart(t)
     assert spec.chart_type is ChartType.LINE and spec.x == "Месяц" and note is None
 
@@ -27,7 +28,8 @@ def test_categories_become_bar_and_pie_is_allowed_for_few():
 
 
 def test_pie_with_many_categories_falls_back_with_note():
-    t = _table(("Город", SemanticType.CATEGORY), ("N", SemanticType.NUMERIC), rows=[[f"г{i}", i] for i in range(20)])
+    t = _table(("Город", SemanticType.CATEGORY), ("N", SemanticType.NUMERIC),
+               rows=[[f"г{i}", i] for i in range(20)])
     spec, note = choose_chart(t, requested=ChartType.PIE)
     assert spec.chart_type is ChartType.BAR
     assert "Круговая диаграмма не подходит" in note
@@ -49,28 +51,40 @@ def test_grounding_flags_invented_numbers():
     assert ungrounded_numbers("Выручка выросла на 37% и составила 999", source) == ["37", "999"]
 
 
-def _state_with_artifact(points: list[str] | None = None) -> SessionState:
+def _state_with_microsession(points: list[str] | None = None) -> SessionState:
     state = SessionState(session_id="s")
-    state.add_artifact(
-        Artifact(id="a1", question="Заказы по городам", intent=Intent.DATA_QUESTION, tool="sql_query", args={},
-                 result=ToolResult(table=CITY_TABLE))
+    micro = ChartMicrosession(
+        id="m1",
+        question="Заказы по городам",
+        chart_type=ChartType.BAR,
+        chart_spec=ChartSpec(chart_type=ChartType.BAR, title="Заказы по городам",
+                             x="Город", y=["Заказы"]),
+        chart_args={},
+        table=CITY_TABLE,
+        points=points or [],
     )
-    state.add_turn(Turn(id="t1", user_message="Заказы по городам", points=points or []))
+    state.add_microsession(micro)
+    state.add_turn(Turn(id="t1", user_message="Заказы по городам",
+                        points=points or [], microsession_id="m1"))
     return state
 
 
 def test_rules_change_view_and_follow_up():
-    state = _state_with_artifact(points=["Пермь лидирует", "Москва отстаёт"])
+    state = _state_with_microsession(points=["Пермь лидирует", "Москва отстаёт"])
+
     d = route_by_rules("А теперь покажи то же самое в другом виде", state)
-    assert d.intent is Intent.CHANGE_VIEW and d.chart_type is None and d.standalone_question == "Заказы по городам"
+    assert d.intent is Intent.EDIT_CHART and d.chart_type is None
+    assert d.standalone_question == "Заказы по городам"
+
     d = route_by_rules("А круговой диаграммой?", state)
-    assert d.intent is Intent.CHANGE_VIEW and d.chart_type is ChartType.PIE
+    assert d.intent is Intent.EDIT_CHART and d.chart_type is ChartType.PIE
+
     d = route_by_rules("Расскажи подробнее про второй пункт", state)
-    assert d.intent is Intent.FOLLOW_UP_DETAIL and d.point_number == 2
+    assert d.intent is Intent.FOLLOW_UP and d.point_number == 2
 
 
 def test_rules_leave_real_questions_to_llm():
-    state = _state_with_artifact()
+    state = _state_with_microsession()
     assert route_by_rules("А теперь то же самое для Москвы", state) is None
     assert route_by_rules("Покажи продажи по Московской области за год", state) is None
     assert route_by_rules("Какие столбцы есть в таблице?", state) is None
@@ -79,8 +93,8 @@ def test_rules_leave_real_questions_to_llm():
 
 def test_rules_refuse_writes_and_answer_help():
     state = SessionState(session_id="s")
-    assert route_by_rules("Удали таблицу продаж", state).intent is Intent.OUT_OF_SCOPE
-    assert route_by_rules("Привет! Что ты умеешь?", state).intent is Intent.HELP
+    assert route_by_rules("Удали таблицу продаж", state).intent is Intent.META_REFUSE
+    assert route_by_rules("Привет! Что ты умеешь?", state).intent is Intent.META_HELP
     assert detect_chart_type("Покажи в виде таблицы") is ChartType.TABLE
 
 
@@ -91,7 +105,8 @@ def test_args_schema_gets_catalog_enums_and_fuzzy_fix():
     schema = build_args_schema(SqlArgs, ["sales"], catalog.column_refs())
     assert schema["properties"]["tables"]["items"]["enum"] == ["sales"]
     assert "x-catalog" not in str(schema)
-    fixed = fix_catalog_refs({"tables": ["Sales", "salse"], "sql": "select 1"}, fields, ["sales"], [])
+    fixed = fix_catalog_refs({"tables": ["Sales", "salse"], "sql": "select 1"},
+                             fields, ["sales"], [])
     assert fixed["tables"] == ["sales", "sales"]
     bad = SqlArgs(tables=["orders"], sql="select 1")
     assert "«orders» нет в данных" in check_catalog_refs(bad, fields, catalog)[0]

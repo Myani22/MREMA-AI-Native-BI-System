@@ -48,22 +48,26 @@ def test_unrenderable_chart_falls_back_to_table_only(tmp_path):
 def test_bar_chart_by_month_for_named_column_renders(tmp_path):
     (tmp_path / "metrics.csv").write_bytes(METRICS)
     question = "Построй столбчатую диаграмму по колонке orders_count"
-    llm = ScriptedLLM(
-        {
-            "intent_decision": [intent("time_patterns", question, wants_chart=True)],
-            "chart_plan": [{"charts": [{"chart_type": "bar", "title": "Заказы по месяцам", "data_requirement": "orders_count по месяцам"}]}],
-            "args_data_query": [
-                {"steps": [{"var": "T", "op": "source", "table": "metrics"},
-                           {"var": "D", "op": "distinct", "input": "T"}],
-                 "output": "D"}
-            ],
-        }
-    )
+    dsl = {
+        "steps": [
+            {"var": "T", "op": "source", "table": "metrics"},
+            {"var": "A", "op": "aggregate", "input": "T", "group_by": ["month"],
+             "aggregates": [{"func": "sum", "column": "orders_count", "alias": "orders_count"}]},
+        ],
+        "output": "A",
+    }
+    llm = ScriptedLLM({
+        "intent_decision": [intent("chart", question)],
+        "chart_plan": [{"items": [{"chart_type": "bar", "title": "Заказы по месяцам",
+                                   "purpose": "orders_count по месяцам"}]}],
+        "dsl_query": [dsl],
+    })
     bundle = build_agent(config=AgentConfig(), llm=llm, data_dir=tmp_path)
     r = asyncio.run(bundle.agent.handle("s1", question))
     assert r.status == "ok", r.blocks
     chart = next(b for b in r.blocks if isinstance(b, ChartBlock))
-    assert chart.spec.chart_type is ChartType.BAR and chart.spec.y == ["orders_count"]
+    assert chart.spec.chart_type is ChartType.BAR
+    assert chart.spec.y == ["orders_count"]
     assert chart.engine_spec is not None
     assert render_png(chart.engine_spec, chart.data).startswith(b"\x89PNG")
 

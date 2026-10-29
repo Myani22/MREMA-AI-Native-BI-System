@@ -9,39 +9,38 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.agent.config import LLMConfig  # noqa: E402
-from app.agent.intents import Intent  # noqa: E402
-from app.agent.llm import OpenAICompatibleClient, StructuredOutputError  # noqa: E402
-from app.agent.memory import SessionState  # noqa: E402
-from app.agent.router import IntentRouter  # noqa: E402
-from tests.agent.fakes import make_catalog  # noqa: E402
+from app.agent.config import LLMConfig
+from app.agent.intents import Intent
+from app.agent.llm import OpenAICompatibleClient, StructuredOutputError
+from app.agent.memory import SessionState
+from app.agent.router import IntentRouter
+from tests.agent.fakes import make_catalog
 
 CASES: list[tuple[str, Intent]] = [
-    ("Что это вообще за данные?", Intent.DATASET_OVERVIEW),
-    ("Сколько здесь записей и за какие даты?", Intent.DATASET_OVERVIEW),
-    ("Опиши структуру таблицы продаж", Intent.DATASET_OVERVIEW),
-    ("Что значит колонка «Канал продажи»?", Intent.DESCRIBE_COLUMN),
-    ("Есть ли пропуски в поле Город?", Intent.DESCRIBE_COLUMN),
-    ("Какие города встречаются чаще всего?", Intent.DISTRIBUTION),
-    ("Как распределены суммы заказов?", Intent.DISTRIBUTION),
-    ("Какая общая сумма продаж в Перми?", Intent.DATA_QUESTION),
-    ("Топ-5 городов по выручке", Intent.DATA_QUESTION),
-    ("Сколько заказов пришло через интернет-магазин в январе?", Intent.DATA_QUESTION),
-    ("Как связаны заказы и покупатели?", Intent.RELATIONSHIPS),
-    ("Есть ли дубли заказов?", Intent.ANOMALIES),
-    ("Найди странные значения в суммах", Intent.ANOMALIES),
-    ("Как менялись продажи по месяцам?", Intent.TIME_PATTERNS),
-    ("Есть ли сезонные пики зимой?", Intent.TIME_PATTERNS),
-    ("Какой паттерн повторяется каждые 12 месяцев?", Intent.TIME_PATTERNS),
-    ("Чем отличаются продажи в рознице и в приложении?", Intent.SEGMENT_COMPARE),
-    ("Как группируются покупатели по типу и каналу?", Intent.SEGMENT_COMPARE),
-    ("Изменения скидки предшествуют росту продаж?", Intent.CORRELATION),
-    ("Сколько продаж ожидать в следующем квартале?", Intent.FORECAST),
-    ("Что будет с выручкой, если поднять цены на 10%?", Intent.FORECAST),
-    ("Собери панель с ключевыми метриками продаж по кварталам", Intent.CREATE_DASHBOARD),
-    ("Какая погода будет завтра?", Intent.OUT_OF_SCOPE),
-    ("Напиши стихотворение про осень", Intent.OUT_OF_SCOPE),
-    ("ну это самое", Intent.UNCLEAR),
+    ("Что это вообще за данные?", Intent.OVERVIEW),
+    ("Сколько здесь записей и за какие даты?", Intent.OVERVIEW),
+    ("Опиши структуру таблицы продаж", Intent.OVERVIEW),
+    ("Что значит колонка «Канал продажи»?", Intent.CHART),
+    ("Есть ли пропуски в поле Город?", Intent.CHART),
+    ("Какие города встречаются чаще всего?", Intent.CHART),
+    ("Как распределены суммы заказов?", Intent.CHART),
+    ("Какая общая сумма продаж в Перми?", Intent.CHART),
+    ("Топ-5 городов по выручке", Intent.CHART),
+    ("Сколько заказов пришло через интернет-магазин в январе?", Intent.CHART),
+    ("Как связаны заказы и покупатели?", Intent.CHART),
+    ("Есть ли дубли заказов?", Intent.CHART),
+    ("Найди странные значения в суммах", Intent.CHART),
+    ("Как менялись продажи по месяцам?", Intent.CHART),
+    ("Есть ли сезонные пики зимой?", Intent.CHART),
+    ("Чем отличаются продажи в рознице и в приложении?", Intent.CHART),
+    ("Как группируются покупатели по типу и каналу?", Intent.CHART),
+    ("Изменения скидки предшествуют росту продаж?", Intent.CHART),
+    ("Сколько продаж ожидать в следующем квартале?", Intent.CHART),
+    ("Что будет с выручкой, если поднять цены на 10%?", Intent.CHART),
+    ("Собери панель с ключевыми метриками продаж по кварталам", Intent.CHART),
+    ("Какая погода будет завтра?", Intent.META_REFUSE),
+    ("Напиши стихотворение про осень", Intent.META_REFUSE),
+    ("ну это самое", Intent.META_UNCLEAR),
 ]
 
 
@@ -65,12 +64,11 @@ async def main() -> None:
         ok += got is expected
         if got is not expected:
             confusion[(expected, got)] += 1
-        print(f"{mark} {latencies[-1]:5.1f}s  {expected.value:>17} -> {getattr(got, 'value', None)!s:<17} {question}")
+        print(f"{mark} {latencies[-1]:5.1f}s  {expected.value:>15} -> {getattr(got, 'value', None)!s:<15} {question}")
     await client.aclose()
     latencies.sort()
     print(f"\nТочность: {ok}/{len(CASES)} = {ok / len(CASES):.0%}")
-    print(f"Задержка: медиана {latencies[len(latencies) // 2]:.1f}s, максимум {latencies[-1]:.1f}s")
-    print(f"Итоговый режим structured output: {client.structured_mode}")
+    print(f"Задержка: медиана {latencies[len(latencies)//2]:.1f}s, максимум {latencies[-1]:.1f}s")
     for (exp, got), n in confusion.most_common():
         print(f"  {exp.value} -> {getattr(got, 'value', None)}: {n}")
 
