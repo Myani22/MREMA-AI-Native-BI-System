@@ -1,3 +1,4 @@
+import csv
 import io
 import re
 import uuid
@@ -33,6 +34,25 @@ def safe_column_name(value: Any, used: set[str]) -> str:
         suffix += 1
     used.add(candidate)
     return candidate
+
+
+def _decode(content: bytes) -> str:
+    for encoding in ("utf-8-sig", "cp1251"):
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return content.decode("utf-8", errors="replace")
+
+
+def _detect_delimiter(content: bytes) -> str:
+    text = _decode(content)
+    try:
+        # Пытаемся автоматически определить разделитель (запятая, точка с запятой, таб, pipe)
+        dialect = csv.Sniffer().sniff(text[:20000], delimiters=",;\t|")
+        return dialect.delimiter
+    except csv.Error:
+        return ","
 
 
 _DATE_FORMATS = (
@@ -109,13 +129,13 @@ def _json_scalar(value):
 
 
 def import_csv_bytes(content: bytes, filename: str, engine: Engine) -> dict:
-    # Keep a stable original-header mapping; pandas mangles duplicate headers, which is safer
-    # than silently creating duplicate SQL column names.
+    delimiter = _detect_delimiter(content)
+    
     try:
-        df = pd.read_csv(io.BytesIO(content), low_memory=False)
+        df = pd.read_csv(io.BytesIO(content), sep=delimiter, low_memory=False)
     except UnicodeDecodeError:
         try:
-            df = pd.read_csv(io.BytesIO(content), encoding="cp1251", low_memory=False)
+            df = pd.read_csv(io.BytesIO(content), sep=delimiter, encoding="cp1251", low_memory=False)
         except Exception as exc:
             raise ValueError(f"Не удалось прочитать CSV: {exc}") from exc
     except Exception as exc:
@@ -126,6 +146,9 @@ def import_csv_bytes(content: bytes, filename: str, engine: Engine) -> dict:
     if len(df.columns) > 500:
         raise ValueError("Слишком много столбцов: максимум 500.")
 
+    if len(df.columns) == 1 and ";" in str(df.columns[0]):
+        df = pd.read_csv(io.BytesIO(content), sep=";", low_memory=False)
+
     original_headers = [str(c) for c in df.columns]
     used: set[str] = set()
     new_headers = [safe_column_name(c, used) for c in original_headers]
@@ -134,15 +157,13 @@ def import_csv_bytes(content: bytes, filename: str, engine: Engine) -> dict:
 
     table_name = f"dataset_{uuid.uuid4().hex[:20]}"
     try:
-        # Explicit schema and generated table name; column names are normalized.
         df.to_sql(
             name=table_name,
             con=engine,
             schema="data",
             if_exists="fail",
             index=False,
-            chunksize=2000,
-            method="multi",
+            chunksize=10000,
         )
     except Exception as exc:
         raise RuntimeError(f"Не удалось записать данные в PostgreSQL: {exc}") from exc
@@ -167,7 +188,6 @@ def import_csv_bytes(content: bytes, filename: str, engine: Engine) -> dict:
                 "columns": profile,
             }
     except Exception:
-        # Avoid leaving an orphaned imported table if metadata persistence fails.
         with engine.begin() as conn:
             conn.execute(text(f'DROP TABLE IF EXISTS data."{table_name}"'))
         raise
