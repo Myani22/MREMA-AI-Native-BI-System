@@ -129,34 +129,45 @@ def test_chart_export_and_png(store):
 
 def test_end_to_end_with_real_engines(store, tmp_path):
     (tmp_path / "Продажи.csv").write_bytes(SALES)
-    llm = ScriptedLLM({
-        "intent_decision": [intent("data_question", "Сколько штук продано в каждом городе?")],
-        "args_data_query": [
-            {"steps": [{"var": "T", "op": "source", "table": "Продажи"},
-                       {"var": "A", "op": "aggregate", "input": "T", "group_by": ["Регион"],
-                        "aggregates": [{"func": "sum", "column": "Количество, шт.", "alias": "Штук"}]}],
-             "output": "A"},
-            {"steps": [{"var": "T", "op": "source", "table": "Продажи"},
-                       {"var": "A", "op": "aggregate", "input": "T", "group_by": ["Город"],
-                        "aggregates": [{"func": "sum", "column": "Количество, шт.", "alias": "Штук"}]},
-                       {"var": "S", "op": "sort", "input": "A", "by": [{"column": "Штук", "dir": "desc"}]}],
-             "output": "S"},
+    bad_dsl = {
+        "steps": [
+            {"var": "T", "op": "source", "table": "Продажи"},
+            {"var": "A", "op": "aggregate", "input": "T", "group_by": ["Регион"],
+             "aggregates": [{"func": "sum", "column": "Количество, шт.", "alias": "Штук"}]},
         ],
-        "narrative": [narrative("Больше всего штук продано в Перми: 13.", ["Пермь: 13", "Москва: 5", "Казань: 2"])],
+        "output": "A",
+    }
+    good_dsl = {
+        "steps": [
+            {"var": "T", "op": "source", "table": "Продажи"},
+            {"var": "A", "op": "aggregate", "input": "T", "group_by": ["Город"],
+             "aggregates": [{"func": "sum", "column": "Количество, шт.", "alias": "Штук"}]},
+            {"var": "S", "op": "sort", "input": "A", "by": [{"column": "Штук", "dir": "desc"}]},
+        ],
+        "output": "S",
+    }
+    llm = ScriptedLLM({
+        "intent_decision": [intent("chart", "Сколько штук продано в каждом городе?")],
+        "chart_plan": [{"items": [{"chart_type": "bar", "title": "Штук по городам", "purpose": "Сравнение"}]}],
+        "dsl_query": [bad_dsl, good_dsl],
     })
     bundle = build_agent(config=AgentConfig(), llm=llm, data_dir=tmp_path)
     r = asyncio.run(bundle.agent.handle("s1", "Сколько штук продано в каждом городе?"))
     assert r.status == "ok", r.blocks
-    assert [c.status for c in r.trace.tool_calls] == ["retryable_error", "ok"]
-    args_prompt = llm.calls[1][1][0].content
-    assert '«Количество, шт.»' in args_prompt and "aggregate" in args_prompt
+    assert [c.status for c in r.trace.tool_calls] == ["ok"]
+    assert any("Регион" in w for w in r.trace.warnings)
+
+    dsl_prompts = [m for name, m in llm.calls if name == "dsl_query"]
+    assert any('«Количество, шт.»' in msgs[0].content for msgs in dsl_prompts)
+
     chart = next(b for b in r.blocks if isinstance(b, ChartBlock))
     assert chart.spec.chart_type is ChartType.BAR and chart.engine_spec["type"] == "bar"
     assert next(b for b in r.blocks if isinstance(b, TableBlock)).data.rows[0] == ["Пермь", 13]
 
     r2 = asyncio.run(bundle.agent.handle("s1", "А круговой диаграммой?"))
     chart2 = next(b for b in r2.blocks if isinstance(b, ChartBlock))
-    assert chart2.spec.chart_type is ChartType.BAR and "пока не поддерживается" in chart2.note
+    assert chart2.spec.chart_type is ChartType.BAR  # PIE не в SUPPORTED
+    assert "пока не поддерживается" in (chart2.note or "")
 
 
 def test_overview_end_to_end(tmp_path):

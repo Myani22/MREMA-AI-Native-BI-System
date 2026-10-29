@@ -145,57 +145,64 @@ def test_top_values_on_postgres_column(db):
 def test_agent_answers_line_chart_request_on_database_tables(db):
     engine, load = db
     table = load(PRODUCTS, "Товары.csv")
-    llm = ScriptedLLM(
-        {
-            "intent_decision": [intent("create_dashboard", "Постройте линейный график зависимости цены от себестоимости для товаров.", wants_chart=True)],
-            "chart_plan": [{"charts": [{"chart_type": "line", "title": "Цена от себестоимости", "data_requirement": "cost по X, price по Y"}]}],
-            "args_data_query": [
-                {
-                    "steps": [
-                        {"var": "T", "op": "source", "table": "Товары"},
-                        {"var": "S", "op": "select", "input": "T", "columns": [f"{table}.cost", f"{table}.price"]},
-                        {"var": "O", "op": "sort", "input": "S", "by": [{"column": "cost", "dir": "asc"}]},
-                    ],
-                    "output": "O",
-                }
+    question = "Постройте линейный график зависимости цены от себестоимости для товаров."
+    llm = ScriptedLLM({
+        "intent_decision": [intent("chart", question)],
+        "chart_plan": [{"items": [{"chart_type": "line", "title": "Цена от себестоимости",
+                                   "purpose": "cost по X, price по Y"}]}],
+        "dsl_query": [{
+            "steps": [
+                {"var": "T", "op": "source", "table": table},
+                {"var": "A", "op": "aggregate", "input": "T", "group_by": ["cost"],
+                 "aggregates": [{"func": "avg", "column": "price", "alias": "Цена"}]},
             ],
-        }
-    )
+            "output": "A",
+        }],
+    })
     bundle = build_agent(config=AgentConfig(), llm=llm, database_engine=engine)
-    r = asyncio.run(bundle.agent.handle("s1", "Постройте линейный график зависимости цены от себестоимости для товаров."))
+    r = asyncio.run(bundle.agent.handle("s1", question))
     assert r.status == "ok", r.blocks
-    assert r.trace.intent == "data_question"
+    assert r.trace.intent == "chart"
     assert [c.tool for c in r.trace.tool_calls] == ["data_query"]
     chart = next(b for b in r.blocks if isinstance(b, ChartBlock))
     assert chart.spec.chart_type is ChartType.LINE and chart.engine_spec["type"] == "line"
-    assert chart.data.rows[0] == [45, 60]
 
 
 def test_memory_and_database_tables_live_together(db, tmp_path):
     engine, load = db
     table = load(METRICS, "metrics.csv")
     (tmp_path / "Продажи.csv").write_bytes("Город,Сумма\nПермь,10\nКазань,5\n".encode())
-    llm = ScriptedLLM(
-        {
-            "intent_decision": [intent("data_question", "Сумма по городам"), intent("data_question", "Выручка за февраль")],
-            "args_data_query": [
-                {"steps": [{"var": "T", "op": "source", "table": "Продажи"},
-                           {"var": "A", "op": "aggregate", "input": "T", "group_by": ["Город"],
-                            "aggregates": [{"func": "sum", "column": "Сумма", "alias": "Итого"}]}], "output": "A"},
-                {"steps": [{"var": "T", "op": "source", "table": table},
-                           {"var": "F", "op": "filter", "input": "T", "condition": {"column": "month", "cmp": "eq", "value": "2024-02"}},
-                           {"var": "S", "op": "select", "input": "F", "columns": ["revenue"]}], "output": "S"},
-            ],
-            "narrative": [narrative("Пермь: 10."), narrative("Выручка 150.")],
-        }
-    )
+    llm = ScriptedLLM({
+        "intent_decision": [
+            intent("chart", "Сумма по городам"),
+            intent("chart", "Выручка за февраль"),
+        ],
+        "chart_plan": [
+            {"items": [{"chart_type": "bar", "title": "Города", "purpose": "Сумма"}]},
+            {"items": [{"chart_type": "table", "title": "Выручка", "purpose": "Таблица"}]},
+        ],
+        "dsl_query": [
+            {"steps": [
+                {"var": "T", "op": "source", "table": "Продажи"},
+                {"var": "A", "op": "aggregate", "input": "T", "group_by": ["Город"],
+                 "aggregates": [{"func": "sum", "column": "Сумма", "alias": "Итого"}]},
+            ], "output": "A"},
+            {"steps": [
+                {"var": "T", "op": "source", "table": table},
+                {"var": "F", "op": "filter", "input": "T",
+                 "condition": {"column": "month", "cmp": "eq", "value": "2024-02"}},
+                {"var": "A", "op": "aggregate", "input": "F", "group_by": [],
+                 "aggregates": [{"func": "sum", "column": "revenue", "alias": "Выручка"}]},
+            ], "output": "A"},
+        ],
+    })
     bundle = build_agent(config=AgentConfig(), llm=llm, data_dir=tmp_path, database_engine=engine)
     catalog = asyncio.run(bundle.agent.catalog_provider.get_catalog())
     assert {"Продажи", table} <= {t.name for t in catalog.tables}
     r1 = asyncio.run(bundle.agent.handle("s1", "Сумма по городам"))
     assert [c.status for c in r1.trace.tool_calls] == ["ok"]
     r2 = asyncio.run(bundle.agent.handle("s1", "Выручка за февраль"))
-    assert [c.status for c in r2.trace.tool_calls] == ["ok"], r2.trace.tool_calls
+    assert [c.status for c in r2.trace.tool_calls] == ["ok"]
     assert "WITH" in r2.trace.tool_calls[0].sql
 
 

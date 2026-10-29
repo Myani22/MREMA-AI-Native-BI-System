@@ -24,12 +24,13 @@ from app.agent.contracts import (
 from app.agent.contracts.tools import ChartHint
 from app.agent.intents import Intent
 from app.agent.llm.client import ChatMessage, LLMReply
-#from app.agent.prompts import SQL_GUIDE
 
 Reply = str | dict[str, Any] | Callable[[Sequence[ChatMessage]], str]
 
 
 class ScriptedLLM:
+    """Fake LLM: returns canned replies keyed by schema_name."""
+
     def __init__(self, script: dict[str, list[Reply]] | None = None):
         self.script = {k: list(v) for k, v in (script or {}).items()}
         self.calls: list[tuple[str, list[ChatMessage]]] = []
@@ -37,7 +38,15 @@ class ScriptedLLM:
     def add(self, schema_name: str, *replies: Reply) -> None:
         self.script.setdefault(schema_name, []).extend(replies)
 
-    async def chat(self, messages, *, json_schema=None, schema_name="response", temperature=None, max_tokens=None):
+    async def chat(
+        self,
+        messages,
+        *,
+        json_schema=None,
+        schema_name="response",
+        temperature=None,
+        max_tokens=None,
+    ):
         self.calls.append((schema_name, list(messages)))
         queue = self.script.get(schema_name)
         if not queue:
@@ -64,16 +73,23 @@ def make_catalog() -> Catalog:
                 period_start="2024-10-01",
                 period_end="2025-09-30",
                 columns=[
-                    ColumnInfo(name="Код заказа", db_type="text", semantic_type=SemanticType.ID),
-                    ColumnInfo(name="Дата операции", db_type="timestamp", semantic_type=SemanticType.DATETIME),
+                    ColumnInfo(name="Код заказа", db_type="text",
+                               semantic_type=SemanticType.ID),
+                    ColumnInfo(name="Дата операции", db_type="timestamp",
+                               semantic_type=SemanticType.DATETIME),
                     ColumnInfo(
                         name="Город",
                         db_type="text",
                         semantic_type=SemanticType.CATEGORY,
-                        top_values=[ValueCount(value="Пермь", count=120), ValueCount(value="Казань", count=80)],
+                        top_values=[
+                            ValueCount(value="Пермь", count=120),
+                            ValueCount(value="Казань", count=80),
+                        ],
                     ),
-                    ColumnInfo(name="Канал продажи", db_type="text", semantic_type=SemanticType.CATEGORY),
-                    ColumnInfo(name="Сумма", db_type="numeric", semantic_type=SemanticType.NUMERIC, unit="руб."),
+                    ColumnInfo(name="Канал продажи", db_type="text",
+                               semantic_type=SemanticType.CATEGORY),
+                    ColumnInfo(name="Сумма", db_type="numeric",
+                               semantic_type=SemanticType.NUMERIC, unit="руб."),
                 ],
             )
         ],
@@ -100,13 +116,17 @@ class EmptyArgs(BaseModel):
 class OverviewTool(BaseTool):
     name = "dataset_overview"
     description = "Обзор всех таблиц: объём, период, состав колонок."
-    intents = frozenset({Intent.DATASET_OVERVIEW})
+    intents = frozenset({Intent.OVERVIEW})
     args_model = EmptyArgs
 
     async def run(self, args, ctx: ToolContext) -> ToolResult:
         t = ctx.catalog.tables[0]
         return ToolResult(
-            facts={"tables": len(ctx.catalog.tables), "rows": t.row_count, "period": f"{t.period_start} — {t.period_end}"},
+            facts={
+                "tables": len(ctx.catalog.tables),
+                "rows": t.row_count,
+                "period": f"{t.period_start} — {t.period_end}",
+            },
             summary_text=f"Загружена 1 таблица «{t.label}» на {t.row_count} строк.",
         )
 
@@ -126,11 +146,18 @@ CITY_TABLE = ResultTable(
 
 
 class SqlTool(BaseTool):
+    """Fake legacy tool kept only for catalog_refs tests (SqlArgs/SqlTool).
+
+    В актуальном оркестраторе не используется — chart-пайплайн идёт через
+    QueryDslTool. Оставлен, чтобы `tests/agent/test_components.py` мог проверить
+    каталог-поля через `SqlArgs`.
+    """
+
     name = "sql_query"
     description = "Произвольный запрос SELECT к данным."
-    intents = frozenset({Intent.DATA_QUESTION, Intent.DISTRIBUTION, Intent.TIME_PATTERNS})
+    intents = frozenset({Intent.CHART, Intent.EDIT_CHART})
     args_model = SqlArgs
-    args_hint = SQL_GUIDE
+    args_hint = ""
     llm_role = "sql"
 
     def __init__(self, table: ResultTable = CITY_TABLE):
@@ -140,7 +167,10 @@ class SqlTool(BaseTool):
     async def run(self, args, ctx: ToolContext) -> ToolResult:
         self.seen.append(args)
         if '"Город2"' in args.sql:
-            return ToolResult(status=ToolStatus.RETRYABLE_ERROR, error="колонки «Город2» нет, похожие: «Город»")
+            return ToolResult(
+                status=ToolStatus.RETRYABLE_ERROR,
+                error="колонки «Город2» нет, похожие: «Город»",
+            )
         top = self.table.rows[0]
         return ToolResult(
             facts={"top": top[0], "top_value": top[1], "groups": len(self.table.rows)},
@@ -151,9 +181,27 @@ class SqlTool(BaseTool):
         )
 
 
-def intent(intent: str, question: str = "вопрос", confidence: float = 0.9, **extra: Any) -> dict[str, Any]:
-    return {"standalone_question": question, "intent": intent, "confidence": confidence, **extra}
+def intent(
+    intent_value: str,
+    question: str = "вопрос",
+    confidence: float = 0.9,
+    **extra: Any,
+) -> dict[str, Any]:
+    return {
+        "standalone_question": question,
+        "intent": intent_value,
+        "confidence": confidence,
+        **extra,
+    }
 
 
-def narrative(summary: str, points: list[str] | None = None, follow_ups: list[str] | None = None) -> dict[str, Any]:
-    return {"summary": summary, "points": points or [], "follow_ups": follow_ups or []}
+def narrative(
+    summary: str,
+    points: list[str] | None = None,
+    follow_ups: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "summary": summary,
+        "points": points or [],
+        "follow_ups": follow_ups or [],
+    }

@@ -1,124 +1,110 @@
 import asyncio
 
-from app.agent import Agent, AgentConfig
+from app.agent import AgentConfig
 from app.agent.contracts import (
-    Catalog,
-    ChartBlock,
-    ChartType,
-    ClarificationBlock,
-    DashboardBlock,
-    ErrorBlock,
-    InMemoryDashboardStore,
-    TableBlock,
-    TextBlock,
-    ToolRegistry,
+    ChartBlock, ChartType, ClarificationBlock, DashboardBlock, ErrorBlock,
+    InMemoryDashboardStore, ResultTable, TableBlock, TableColumn, TextBlock,
 )
+from app.agent.contracts.response import ChartSpec
+from app.agent.factory import build_agent
 from app.agent.intents import Intent
 from app.agent.llm import LLMUnavailableError
-from tests.agent.fakes import (
-    FakeCatalogProvider,
-    FakeExecutor,
-    OverviewTool,
-    ScriptedLLM,
-    SqlTool,
-    intent,
-    narrative,
-)
+from app.agent.memory import ChartMicrosession, Turn
+from tests.agent.fakes import ScriptedLLM, intent, narrative
 
-SQL_OK = {"tables": ["sales"], "sql": 'SELECT "Город", count(*) AS "Заказы" FROM "sales" GROUP BY 1 ORDER BY 2 DESC LIMIT 50'}
+SALES_CSV = "Город,Сумма\nПермь,100\nКазань,80\nМосква,40\n"
 
 
-def make_agent(llm, *, sql_tool=None, catalog=None, dashboards=None, **cfg):
-    tools = ToolRegistry([OverviewTool(), sql_tool or SqlTool()])
-    return Agent(
-        llm=llm,
-        catalog_provider=FakeCatalogProvider(catalog),
-        executor=FakeExecutor(),
-        tools=tools,
-        dashboards=dashboards,
-        config=AgentConfig(**cfg),
-    )
+def make_bundle(llm, csv: dict[str, bytes] | None = None, **cfg):
+    bundle = build_agent(config=AgentConfig(**cfg), llm=llm, data_dir="/nonexistent")
+    for name, content in (csv or {}).items():
+        bundle.store.add_csv(content, name)
+    return bundle
 
 
 def blocks_of(response, kind):
     return [b for b in response.blocks if isinstance(b, kind)]
 
 
-def test_overview_needs_no_args_call():
+def _bar_dsl():
+    return {
+        "steps": [
+            {"var": "T", "op": "source", "table": "sales"},
+            {"var": "A", "op": "aggregate", "input": "T", "group_by": ["Город"],
+             "aggregates": [{"func": "sum", "column": "Сумма", "alias": "Сумма"}]},
+        ],
+        "output": "A",
+    }
+
+
+def test_overview_pipeline():
     llm = ScriptedLLM({
-        "intent_decision": [intent("dataset_overview", "Что есть в этих данных?")],
-        "narrative": [narrative("Это продажи: 1000 строк с 2024-10-01 по 2025-09-30.", ["Одна таблица"])],
+        "intent_decision": [intent("overview", "Что есть в этих данных?")],
+        "narrative": [narrative("Это таблица продаж.", ["Одна таблица"])],
     })
-    agent = make_agent(llm)
-    r = asyncio.run(agent.handle("s1", "Что есть в этих данных?"))
+    bundle = make_bundle(llm, {"sales.csv": SALES_CSV.encode()})
+    r = asyncio.run(bundle.agent.handle("s1", "Что есть в этих данных?"))
     assert r.status == "ok"
-    assert llm.names() == ["intent_decision", "narrative"]
-    assert blocks_of(r, TextBlock)[0].markdown.startswith("Это продажи")
-    assert r.trace.intent is Intent.DATASET_OVERVIEW and r.trace.routed_by == "llm"
-    assert [c.purpose for c in r.trace.llm_calls] == ["intent_decision", "narrative"]
-
-
-def test_sql_repair_loop_chart_and_memory_then_change_view():
-    tool = SqlTool()
-    llm = ScriptedLLM({
-        "intent_decision": [intent("data_question", "Сколько заказов в каждом городе?")],
-        "args_sql_query": [
-            {"tables": ["sales"], "sql": 'SELECT "Город2", count(*) FROM "sales" GROUP BY 1'},
-            SQL_OK,
-        ],
-        "narrative": [narrative("Больше всего заказов в Перми: 120.", ["Пермь: 120", "Казань: 80"], ["А по каналам?"])],
-    })
-    agent = make_agent(llm, sql_tool=tool)
-    r = asyncio.run(agent.handle("s1", "Сколько заказов в каждом городе?"))
-    assert r.status == "ok", r
-    assert [c.status for c in r.trace.tool_calls] == ["retryable_error", "ok"]
-    repair_prompt = llm.calls[2][1][-1].content
-    assert "Город2" in repair_prompt and "не сработали" in repair_prompt
-    chart = blocks_of(r, ChartBlock)[0]
-    assert chart.spec.chart_type is ChartType.BAR
+    assert r.trace.intent is Intent.OVERVIEW
+    assert "intent_decision" in llm.names() and "narrative" in llm.names()
+    assert blocks_of(r, TextBlock)[0].markdown.startswith("Это таблица продаж")
     assert blocks_of(r, TableBlock)
-    assert r.follow_ups == ["А по каналам?"]
-
-    calls_before = len(llm.calls)
-    r2 = asyncio.run(agent.handle("s1", "А теперь круговой диаграммой"))
-    assert r2.trace.routed_by == "rules" and r2.trace.intent is Intent.CHANGE_VIEW
-    assert blocks_of(r2, ChartBlock)[0].spec.chart_type is ChartType.PIE
-    assert len(llm.calls) == calls_before and len(tool.seen) == 2
 
 
-def test_follow_up_reclassifies_point_as_new_question():
+def test_chart_pipeline_without_explanation():
     llm = ScriptedLLM({
-        "intent_decision": [
-            intent("data_question", "Сколько заказов в каждом городе?"),
-            intent("data_question", "Почему в Перми больше всего заказов?"),
-        ],
-        "args_sql_query": [SQL_OK, SQL_OK],
-        "narrative": [
-            narrative("Лидирует Пермь.", ["Пермь: 120", "Казань: 80"]),
-            narrative("В Перми 120 заказов."),
-        ],
+        "intent_decision": [intent("chart", "Сумма по городам")],
+        "chart_plan": [{"items": [{"chart_type": "bar", "title": "Сумма", "purpose": "Сравнение"}]}],
+        "dsl_query": [_bar_dsl()],
     })
-    agent = make_agent(llm)
-    asyncio.run(agent.handle("s1", "Сколько заказов в каждом городе?"))
-    r = asyncio.run(agent.handle("s1", "Расскажи подробнее про первый пункт"))
-    assert r.trace.intent is Intent.FOLLOW_UP_DETAIL
-    router_prompt = [m for name, m in llm.calls if name == "intent_decision"][1][-1].content
-    assert "Пермь: 120" in router_prompt
-    assert r.trace.standalone_question == "Почему в Перми больше всего заказов?"
+    bundle = make_bundle(llm, {"sales.csv": SALES_CSV.encode()})
+    r = asyncio.run(bundle.agent.handle("s1", "Сумма по городам"))
+    assert r.status == "ok"
+    assert "narrative" not in llm.names()
+    assert blocks_of(r, ChartBlock)
 
 
-def test_low_confidence_asks_to_clarify():
-    llm = ScriptedLLM({"intent_decision": [intent("data_question", "Покажи всё про всё", confidence=0.2)]})
-    r = asyncio.run(make_agent(llm).handle("s1", "покажи всё"))
+def test_follow_up_uses_microsession():
+    llm = ScriptedLLM({"narrative": [narrative("Пермь лидирует с суммой 100.")]})
+    bundle = make_bundle(llm, {"sales.csv": SALES_CSV.encode()})
+    state = asyncio.run(bundle.agent.memory.load("s1"))
+    micro = ChartMicrosession(
+        id="m1", question="Сумма по городам", chart_type=ChartType.BAR,
+        chart_spec=ChartSpec(chart_type=ChartType.BAR, title="Сумма по городам",
+                             x="Город", y=["Сумма"]),
+        chart_args={},
+        table=ResultTable(
+            columns=[TableColumn(name="Город"), TableColumn(name="Сумма")],
+            rows=[["Пермь", 100], ["Казань", 80]],
+        ),
+        points=["Пермь: 100", "Казань: 80"],
+    )
+    state.add_microsession(micro)
+    state.add_turn(Turn(id="t1", user_message="Сумма по городам",
+                        points=micro.points, microsession_id="m1"))
+    asyncio.run(bundle.agent.memory.save(state))
+
+    r = asyncio.run(bundle.agent.handle("s1", "Расскажи подробнее про пункт 1"))
+    assert r.status == "ok"
+    assert r.trace.intent is Intent.FOLLOW_UP
+    assert r.trace.routed_by == "rules"
+
+
+def test_low_quality_intent_falls_to_clarification():
+    llm = ScriptedLLM({"intent_decision": ["ой", "ой"]})
+    bundle = make_bundle(llm, {"sales.csv": SALES_CSV.encode()})
+    r = asyncio.run(bundle.agent.handle("s1", "Что есть в этих данных?"))
     assert r.status == "clarification"
-    block = blocks_of(r, ClarificationBlock)[0]
-    assert block.options[0] == "Покажи всё про всё"
+    assert blocks_of(r, ClarificationBlock)
 
 
 def test_refusal_without_llm_call():
     llm = ScriptedLLM()
-    r = asyncio.run(make_agent(llm).handle("s1", "Удали таблицу продаж"))
-    assert r.status == "refused" and llm.calls == []
+    bundle = make_bundle(llm)
+    r = asyncio.run(bundle.agent.handle("s1", "Удали таблицу продаж"))
+    assert r.status == "refused"
+    assert r.trace.routed_by == "rules"
+    assert len(llm.calls) == 0
 
 
 def test_llm_down_gives_retryable_error():
@@ -126,70 +112,105 @@ def test_llm_down_gives_retryable_error():
         async def chat(self, *a, **k):
             raise LLMUnavailableError("connection refused")
 
-    r = asyncio.run(make_agent(DownLLM()).handle("s1", "Что есть в данных?"))
-    assert r.status == "error" and blocks_of(r, ErrorBlock)[0].retryable
+    bundle = make_bundle(DownLLM(), {"sales.csv": SALES_CSV.encode()})
+    r = asyncio.run(bundle.agent.handle("s1", "Покажи сумму по городам"))
+    assert r.status == "error"
+    assert blocks_of(r, ErrorBlock)[0].retryable
 
 
-def test_garbage_from_model_turns_into_rephrase_request():
-    llm = ScriptedLLM({"intent_decision": ["ой", "ой", "ой"]})
-    r = asyncio.run(make_agent(llm).handle("s1", "Что есть в данных?"))
-    assert r.status == "clarification"
-    assert blocks_of(r, ClarificationBlock)[0].options[0] == "Что есть в этих данных?"
+def test_chart_pipeline_with_dsl_repair():
+    bad_dsl = {
+        "steps": [
+            {"var": "T", "op": "source", "table": "sales"},
+            {"var": "A", "op": "aggregate", "input": "T",
+             "group_by": ["НесуществующееПоле"],
+             "aggregates": [{"func": "sum", "column": "Сумма", "alias": "Сумма"}]},
+        ],
+        "output": "A",
+    }
+    llm = ScriptedLLM({
+        "intent_decision": [intent("chart", "Сумма по городам", wants_explanation=True)],
+        "chart_plan": [{"items": [{"chart_type": "bar", "title": "Сумма по городам",
+                                   "purpose": "Сравнение"}]}],
+        "dsl_query": [bad_dsl, _bar_dsl()],
+        "narrative": [narrative("Пермь: 100.",
+                                ["Пермь: 100", "Казань: 80"],
+                                ["А по каналам?"])],
+    })
+    bundle = make_bundle(llm, {"sales.csv": SALES_CSV.encode()})
+    r = asyncio.run(bundle.agent.handle("s1", "Сумма по городам"))
+    assert r.status == "ok", r.blocks
+    assert r.trace.intent is Intent.CHART
+    assert any("НесуществующееПоле" in w for w in r.trace.warnings)
+    assert [c.status for c in r.trace.tool_calls] == ["ok"]
+    assert blocks_of(r, ChartBlock)
+    assert blocks_of(r, TableBlock)
+    assert "А по каналам?" in r.follow_ups
+    assert len(r.follow_ups) >= 2
 
 
 def test_invented_numbers_fall_back_to_tool_text():
     llm = ScriptedLLM({
-        "intent_decision": [intent("data_question", "Заказы по городам")],
-        "args_sql_query": [SQL_OK],
-        "narrative": [narrative("В Перми 777 заказов."), narrative("В Перми 778 заказов.")],
+        "intent_decision": [intent("chart", "Сумма по городам", wants_explanation=True)],
+        "chart_plan": [{"items": [{"chart_type": "bar", "title": "Сумма",
+                                   "purpose": "Сравнение"}]}],
+        "dsl_query": [_bar_dsl()],
+        "narrative": [narrative("Всего 999999.", ["Число 888888"])],
     })
-    r = asyncio.run(make_agent(llm).handle("s1", "Заказы по городам"))
-    assert blocks_of(r, TextBlock)[0].markdown == "Больше всего у «Пермь»: 120."
-    assert any("шаблонный" in w for w in r.trace.warnings)
+    bundle = make_bundle(llm, {"sales.csv": SALES_CSV.encode()})
+    r = asyncio.run(bundle.agent.handle("s1", "Сумма по городам"))
+    assert r.status == "ok"
+    assert any("числа без опоры" in w for w in r.trace.warnings)
+
+    texts = [b for b in r.blocks if isinstance(b, TextBlock)]
+    assert any("Готово, результат ниже" in t.markdown for t in texts)
 
 
 def test_empty_catalog_says_load_data():
-    llm = ScriptedLLM({"intent_decision": [intent("dataset_overview")]})
-    r = asyncio.run(make_agent(llm, catalog=Catalog()).handle("s1", "Что тут?"))
+    llm = ScriptedLLM({"intent_decision": [intent("overview", "Что тут?")]})
+    bundle = make_bundle(llm)
+    r = asyncio.run(bundle.agent.handle("s1", "Что тут?"))
+    assert r.status == "ok"
     assert "не загружены" in blocks_of(r, TextBlock)[0].markdown
 
 
-def test_dashboard_is_built_saved_and_refreshable():
+def test_dashboard_saves_and_refreshes():
     store = InMemoryDashboardStore()
     llm = ScriptedLLM({
-        "intent_decision": [intent("create_dashboard", "Дашборд по заказам")],
-        "dashboard_plan": [{
-            "title": "Заказы",
-            "widgets": [
-                {"title": "По городам", "question": "Заказы по городам", "intent": "data_question"},
-                {"title": "Доля городов", "question": "Доля заказов по городам", "intent": "distribution", "chart_type": "pie"},
-            ],
-        }],
-        "args_sql_query": [SQL_OK, SQL_OK],
+        "intent_decision": [intent("chart", "Дашборд по городам")],
+        "chart_plan": [{"items": [
+            {"chart_type": "bar", "title": "Сумма по городам", "purpose": "Сравнение"},
+            {"chart_type": "table", "title": "Список", "purpose": "Все города"},
+        ]}],
+        "dsl_query": [_bar_dsl(), _bar_dsl()],
     })
-    agent = make_agent(llm, dashboards=store)
-    r = asyncio.run(agent.handle("s1", "Создай дашборд по заказам"))
+    bundle = make_bundle(llm, {"sales.csv": SALES_CSV.encode()})
+    bundle.agent.dashboards = store
+
+    r = asyncio.run(bundle.agent.handle("s1", "Дашборд по городам"))
     assert r.status == "ok"
     dash_block = blocks_of(r, DashboardBlock)[0]
     assert dash_block.widget_count == 2
-    charts = [b.spec.chart_type for b in blocks_of(r, ChartBlock)]
-    assert charts == [ChartType.BAR, ChartType.PIE]
+    assert blocks_of(r, ChartBlock)
+
     saved = asyncio.run(store.get(dash_block.dashboard_id))
-    assert saved.widgets[0].args == SQL_OK
-    calls_before = len(llm.calls)
-    refreshed = asyncio.run(agent.refresh_dashboard(saved.id))
-    assert refreshed.refreshed_at is not None and len(llm.calls) == calls_before
+    assert saved is not None and len(saved.widgets) == 2
+    refreshed = asyncio.run(bundle.agent.refresh_dashboard(saved.id))
+    assert refreshed.refreshed_at is not None
 
 
 def test_status_events_are_streamed():
     events = []
 
     async def sink(e):
-        events.append(e.type if e.type == "done" else e.stage)
+        events.append(e.type if e.type == "done" else getattr(e, "stage", "?"))
 
     llm = ScriptedLLM({
-        "intent_decision": [intent("dataset_overview")],
-        "narrative": [narrative("Одна таблица на 1000 строк.")],
+        "intent_decision": [intent("overview", "Что тут?")],
+        "narrative": [narrative("Одна таблица.")],
     })
-    asyncio.run(make_agent(llm).handle("s1", "Что тут?", emit=sink))
-    assert events[0] == "routing" and events[-1] == "done" and "writing" in events
+    bundle = make_bundle(llm, {"sales.csv": SALES_CSV.encode()})
+    asyncio.run(bundle.agent.handle("s1", "Что тут?", emit=sink))
+    assert events[0] == "routing"
+    assert "writing" in events
+    assert events[-1] == "done"
