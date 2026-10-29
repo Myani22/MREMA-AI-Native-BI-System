@@ -76,15 +76,17 @@ if "session_id" not in st.session_state:
     st.session_state.chat_name = generate_chat_name()
     st.session_state.messages = []
 
-if "available_tables" not in st.session_state:
+def fetch_available_tables():
     try:
-        cat_resp = requests.get(f"{API_URL}/catalog", timeout=5)
+        cat_resp = requests.get(f"{API_URL}/catalog", timeout=3)
         if cat_resp.status_code == 200:
-            st.session_state.available_tables = [t["name"] for t in cat_resp.json().get("tables", [])]
-        else:
-            st.session_state.available_tables = []
-    except:
-        st.session_state.available_tables = []
+            return [t["name"] for t in cat_resp.json().get("tables", [])]
+    except Exception:
+        pass
+    return []
+
+if "available_tables" not in st.session_state:
+    st.session_state.available_tables = fetch_available_tables()
 
 with st.sidebar:
     render_server_status()
@@ -100,13 +102,6 @@ with st.sidebar:
     st.divider()
     
     debug_mode = st.toggle("Режим отладки")
-
-    st.header("Фильтр таблиц")
-    selected_tables = st.multiselect(
-        "Искать только в таблицах:",
-        options=st.session_state.available_tables,
-        default=st.session_state.available_tables
-    )
     
     st.header("Загрузка CSV")
     
@@ -263,6 +258,23 @@ for msg_idx, msg in enumerate(st.session_state.messages):
                                     st.error("Не удалось сгенерировать график (ошибка рендерера)")
                             except Exception:
                                 st.error("Таймаут или ошибка при генерации графика")
+
+st.markdown("---")
+col_select, col_refresh = st.columns([9, 1])
+
+with col_refresh:
+    st.write("") # Небольшой отступ, чтобы кнопка выровнялась по высоте с селектором
+    if st.button("🔄", help="Обновить список таблиц из БД", use_container_width=True):
+        st.session_state.available_tables = fetch_available_tables()
+        st.rerun()
+
+with col_select:
+    selected_tables = st.multiselect(
+        "Поиск только в этих таблицах:",
+        options=st.session_state.available_tables,
+        default=st.session_state.get("selected_tables", st.session_state.available_tables),
+        key="selected_tables"
+    )
 
 if prompt := st.chat_input("Введите запрос..."):
     st.session_state.messages.append({"role": "user", "content": prompt})

@@ -435,18 +435,23 @@ class Agent:
                 dsl_warnings: list[str] = []
             else:
                 await self._status(run, "planning", f"Собираю запрос: {item.title}")
-                args, dsl_warnings = await build_dsl(
-                    run.sql_llm,
-                    question=question,
-                    chart_type=item.chart_type,
-                    title=item.title,
-                    purpose=item.purpose,
-                    catalog=run.catalog,
-                    tables=tables,
-                    budget=budget,
-                    max_attempts_per_step=self.config.per_step_error_budget,
-                )
-                run.trace.warnings.extend(dsl_warnings)
+                try:
+                    args, dsl_warnings = await build_dsl(
+                        run.sql_llm,
+                        question=question,
+                        chart_type=item.chart_type,
+                        title=item.title,
+                        purpose=item.purpose,
+                        catalog=run.catalog,
+                        tables=tables,
+                        budget=budget,
+                        max_attempts_per_step=self.config.per_step_error_budget,
+                    )
+                    run.trace.warnings.extend(dsl_warnings)
+                except Exception as e:
+                    log.exception("Ошибка в build_dsl для графика %s", item.title)
+                    args = None
+                    dsl_warnings = [f"Внутренняя ошибка сборки запроса: {e}"]
 
             if args is None:
                 reason = dsl_warnings[-1] if dsl_warnings else "не удалось построить DSL"
