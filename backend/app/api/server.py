@@ -26,6 +26,7 @@ MAX_UPLOAD_BYTES = 300 * 1024 * 1024
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     session_id: str | None = Field(None, description="Пусто — начать новый диалог")
+    tables: list[str] | None = Field(None, description="Список таблиц для поиска")
 
 
 class TurnView(BaseModel):
@@ -100,7 +101,11 @@ def create_app(bundle: AgentBundle | None = None) -> FastAPI:
 
     @app.post("/api/chat", response_model=AgentResponse)
     async def chat(request: ChatRequest) -> AgentResponse:
-        return await agent.handle(request.session_id or uuid.uuid4().hex, request.message)
+        return await agent.handle(
+            request.session_id or uuid.uuid4().hex, 
+            request.message,
+            tables=request.tables
+        )
 
     @app.post("/api/chat/stream")
     async def chat_stream(request: ChatRequest) -> StreamingResponse:
@@ -112,7 +117,7 @@ def create_app(bundle: AgentBundle | None = None) -> FastAPI:
 
         async def run() -> None:
             try:
-                await agent.handle(session_id, request.message, emit=emit)
+                await agent.handle(session_id, request.message, tables=request.tables, emit=emit)
             except BaseException as e:
                 log.exception("chat_stream agent.handle failed")
                 from app.agent.prompts import GENERIC_ERROR_TEXT
