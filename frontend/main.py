@@ -260,25 +260,63 @@ for msg_idx, msg in enumerate(st.session_state.messages):
                             except Exception:
                                 st.error("Таймаут или ошибка при генерации графика")
 
-st.markdown("---")
-col_select, col_refresh = st.columns([9, 1])
+st.markdown(
+    """
+    <style>
+    /* Уменьшаем отступ сверху у блока с поповером */
+    div[data-testid="stVerticalBlock"] > div:has(div[data-testid="stPopover"]) {
+        padding-top: 0rem;
+        padding-bottom: 0rem;
+        margin-bottom: -0.5rem; /* Подтягиваем поле ввода поближе */
+    }
+    /* Делаем кнопку чуть аккуратнее */
+    button[data-testid="baseButton-headerNoPadding"] {
+        padding-top: 0.2rem;
+        padding-bottom: 0.2rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
-with col_refresh:
-    st.write("") # Небольшой отступ, чтобы кнопка выровнялась по высоте с селектором
-    if st.button("🔄", help="Обновить список таблиц из БД", use_container_width=True):
+if "selected_tables" not in st.session_state:
+    st.session_state.selected_tables = list(st.session_state.available_tables.keys())
+
+selected = st.session_state.selected_tables
+total = len(st.session_state.available_tables)
+
+if len(selected) == total and total > 0:
+    btn_label = "➕ Все таблицы"
+elif len(selected) == 0:
+    btn_label = "➕ Все таблицы"
+elif len(selected) == 1:
+    btn_label = f"📄 {st.session_state.available_tables.get(selected[0], selected[0])}"
+else:
+    btn_label = f"📁 Выбрано: {len(selected)}"
+
+with st.popover(btn_label, use_container_width=False):
+    st.markdown("**Поиск в таблицах:**")
+    
+    st.multiselect(
+        "Выберите таблицы:",
+        options=list(st.session_state.available_tables.keys()),
+        default=selected,
+        format_func=lambda x: st.session_state.available_tables.get(x, x),
+        label_visibility="collapsed",
+        key="widget_tables",
+        on_change=lambda: st.session_state.update({"selected_tables": st.session_state.widget_tables})
+    )
+    
+    if st.button("🔄 Обновить список", use_container_width=True):
         st.session_state.available_tables = fetch_available_tables()
+        st.session_state.selected_tables = list(st.session_state.available_tables.keys())
+        if "widget_tables" in st.session_state:
+            del st.session_state.widget_tables
         st.rerun()
 
-with col_select:
-    selected_tables = st.multiselect(
-        "Поиск только в этих таблицах:",
-        options=list(st.session_state.available_tables.keys()),
-        default=st.session_state.get("selected_tables", list(st.session_state.available_tables.keys())),
-        format_func=lambda x: st.session_state.available_tables.get(x, x),
-        key="selected_tables"
-    )
+prompt = st.chat_input("Введите запрос...")
 
-if prompt := st.chat_input("Введите запрос..."):
+if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
     st.rerun()
 
@@ -292,7 +330,7 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
                 payload = {
                     "message": prompt, 
                     "session_id": st.session_state.session_id,
-                    "tables": selected_tables if selected_tables else None
+                    "tables": selected if selected else None
                 }
                 
                 resp = requests.post(
@@ -313,7 +351,6 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
                                 try:
                                     event_data = json.loads(data_str)
                                     if event_data.get("type") == "status":
-                                        # Обновляем статус в UI
                                         status.update(label=f"⏳ {event_data.get('message')}")
                                     elif event_data.get("type") == "done":
                                         final_data = event_data.get("response")
