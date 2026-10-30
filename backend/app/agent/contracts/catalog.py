@@ -37,6 +37,10 @@ class ColumnInfo(BaseModel):
     distinct_count: int | None = None
     min_value: str | None = None
     max_value: str | None = None
+    mean_value: str | None = Field(None, description="Среднее значение (только для числовых)")
+    median_value: str | None = Field(None, description="Медиана (только для числовых)")
+    p25_value: str | None = Field(None, description="25-й перцентиль (только для числовых)")
+    p75_value: str | None = Field(None, description="75-й перцентиль (только для числовых)")
     top_values: list[ValueCount] = Field(default_factory=list, description="До 10 самых частых значений")
     sample_values: list[str] = Field(default_factory=list, description="До 5 примеров значений")
 

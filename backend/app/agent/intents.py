@@ -8,6 +8,7 @@ class Intent(StrEnum):
     META_REFUSE = "refuse"
     META_UNCLEAR = "unclear"
     OVERVIEW = "overview"
+    EXPLAIN = "explain"
     CHART = "chart"
     EDIT_CHART = "edit_chart"
     FOLLOW_UP = "follow_up"
@@ -31,6 +32,7 @@ class Intent(StrEnum):
 
 INTENT_DESCRIPTIONS: dict[Intent, str] = {
     Intent.OVERVIEW: "что в данных (какие таблицы, колонки, периоды)",
+    Intent.EXPLAIN: "объяснение смысла конкретного поля, частые значения или связи между таблицами (текстовый ответ)",
     Intent.CHART: "любой вопрос к данным (посчитать, показать, построить график, собрать дашборд)",
     Intent.EDIT_CHART: "изменить предыдущий график (тип или данные)",
     Intent.FOLLOW_UP: "подробнее про конкретный пункт предыдущего ответа",

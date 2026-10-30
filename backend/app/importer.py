@@ -46,13 +46,31 @@ def _decode(content: bytes) -> str:
 
 
 def _detect_delimiter(content: bytes) -> str:
+    """Определяет разделитель CSV. Приоритет: ; > \\t > | > ,
+    
+    Разделитель валиден только если он встречается одинаковое число раз
+    в каждой непустой строке (консистентность). Запятая — всегда последняя,
+    т.к. часто встречается внутри чисел («298,70», «1,5»).
+    """
     text = _decode(content)
-    try:
-        # Пытаемся автоматически определить разделитель (запятая, точка с запятой, таб, pipe)
-        dialect = csv.Sniffer().sniff(text[:20000], delimiters=",;\t|")
-        return dialect.delimiter
-    except csv.Error:
+    lines = [line for line in text.splitlines()[:30] if line.strip()]
+    if not lines:
         return ","
+
+    for delim in (";", "\t", "|"):
+        counts = [line.count(delim) for line in lines]
+        if counts[0] > 0 and len(set(counts)) == 1:
+            return delim
+
+    comma_counts = [line.count(",") for line in lines]
+    if comma_counts[0] > 0 and len(set(comma_counts)) == 1:
+        return ","
+
+    for delim in (";", "\t", "|", ","):
+        if any(line.count(delim) > 0 for line in lines):
+            return delim
+
+    return ","
 
 
 _DATE_FORMATS = (

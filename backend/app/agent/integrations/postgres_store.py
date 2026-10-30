@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import re
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import text
@@ -185,6 +186,24 @@ class PostgresCatalogProvider:
         )
         if kind in ("int", "float", "date") and semantic is not SemanticType.ID and cmin is not None:
             info.min_value, info.max_value = _fmt(cmin), _fmt(cmax)
+        if kind in ("int", "float") and semantic is not SemanticType.ID:
+            try:
+                stats = conn.execute(
+                    text(
+                        f"SELECT avg({col}), "
+                        f"percentile_cont(0.5) WITHIN GROUP (ORDER BY {col}), "
+                        f"percentile_cont(0.25) WITHIN GROUP (ORDER BY {col}), "
+                        f"percentile_cont(0.75) WITHIN GROUP (ORDER BY {col}) "
+                        f"FROM {source}"
+                    )
+                ).one()
+            except Exception:
+                stats = None
+            if stats and stats[0] is not None:
+                info.mean_value = _fmt(stats[0])
+                info.median_value = _fmt(stats[1])
+                info.p25_value = _fmt(stats[2])
+                info.p75_value = _fmt(stats[3])
         if semantic in (SemanticType.CATEGORY, SemanticType.BOOLEAN, SemanticType.TEXT):
             rows = conn.execute(
                 text(
@@ -197,6 +216,8 @@ class PostgresCatalogProvider:
 
 
 def _fmt(value: Any) -> str:
+    if isinstance(value, Decimal):
+        return f"{float(value):g}"
     if hasattr(value, "isoformat"):
         return value.isoformat()
     if isinstance(value, float):

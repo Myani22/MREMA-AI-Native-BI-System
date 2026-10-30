@@ -98,8 +98,21 @@ def _column_facts(catalog: Catalog, ref: str) -> dict[str, Any] | None:
         facts["единица"] = col.unit
     if col.min_value is not None:
         facts["минимум"], facts["максимум"] = col.min_value, col.max_value
+    if col.mean_value is not None:
+        facts["среднее"] = col.mean_value
+        facts["медиана"] = col.median_value
+        facts["25_перцентиль"] = col.p25_value
+        facts["75_перцентиль"] = col.p75_value
     if col.top_values:
-        facts["частые_значения"] = {v.value: v.count for v in col.top_values[:10]}
+        total = table.row_count or None
+        facts["частые_значения"] = [
+            {
+                "значение": v.value,
+                "количество": v.count,
+                "доля_процентов": round(v.count / total * 100, 2) if total else None,
+            }
+            for v in col.top_values[:10]
+        ]
     elif col.sample_values:
         facts["примеры"] = col.sample_values
     return facts
@@ -108,7 +121,7 @@ def _column_facts(catalog: Catalog, ref: str) -> dict[str, Any] | None:
 class DescribeColumnTool(BaseTool):
     name = "describe_column"
     description = "Описывает одно поле: тип, число разных значений, пропуски, диапазон, частые значения."
-    intents = frozenset()
+    intents = frozenset({Intent.EXPLAIN})
     args_model = ColumnArgs
 
     async def run(self, args: ColumnArgs, ctx: ToolContext) -> ToolResult:
@@ -130,7 +143,7 @@ class TopValuesArgs(BaseModel):
 class TopValuesTool(BaseTool):
     name = "top_values"
     description = "Частые значения одной колонки с количеством и долей; для числовых и дат — распределение по значениям."
-    intents = frozenset()
+    intents = frozenset({Intent.EXPLAIN})
     args_model = TopValuesArgs
 
     def __init__(self, schema: Callable[[], dict[str, dict[str, str]]], sources: Callable[[], dict[str, Any]]):
@@ -195,7 +208,7 @@ class RelationsArgs(BaseModel):
 class RelationsTool(BaseTool):
     name = "relationships"
     description = "Показывает, как таблицы и записи связаны через общие идентификаторы."
-    intents = frozenset()
+    intents = frozenset({Intent.EXPLAIN})
     args_model = RelationsArgs
 
     async def run(self, args: RelationsArgs, ctx: ToolContext) -> ToolResult:

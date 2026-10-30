@@ -59,6 +59,7 @@ from .narrator import narrate, narrate_dashboard
 from .planner import ChartPlan, ChartPlanItem, plan_charts
 from .prompts import (
     CLARIFY_DEFAULT,
+    EMPTY_RESULT_TEXT,
     EXPLAIN_FAILURE_SYSTEM,
     GENERIC_ERROR_TEXT,
     HELP_TEXT,
@@ -68,7 +69,7 @@ from .prompts import (
     OUT_OF_SCOPE_TEXT,
 )
 from .router import IntentDecision, IntentRouter
-from .schema_linking import select_tables
+from .schema_linking import render_schema, select_tables
 from .viz import alternative_chart, candidates, choose_chart
 from .integrations.dsl_edit import (
     apply_limit_to_dsl, apply_sort_to_dsl,
@@ -127,6 +128,33 @@ class TracingLLM:
         )
         return reply
 
+from .catalog_refs import build_args_schema, catalog_fields, fix_catalog_refs
+
+@dataclass
+class _ExecutionResult:
+    result: ToolResult
+    tables: list[str] = field(default_factory=list)
+
+
+_EXPLAIN_TOOL_HINTS: list[tuple[str, tuple[str, ...]]] = [
+    ("relationships", ("связ", "связи", "связывает", "relat", "relations",
+                       "join", "идентификатор", "пересечен")),
+    ("top_values",   ("част", "топ-", "топ ", "top ", "распредел", "сколько раз",
+                       "встреча", "чаще всего", "доля")),
+    ("describe_column", ("что значит", "означает", "опис", "происхожден", "тип",
+                          "пропуск", "null", "расскажи про поле")),
+]
+
+
+def _pick_explain_tool(tools: list[BaseTool], question: str) -> BaseTool:
+    q = question.lower()
+    for tool_name, keys in _EXPLAIN_TOOL_HINTS:
+        if not any(k in q for k in keys):
+            continue
+        for t in tools:
+            if t.name == tool_name:
+                return t
+    return tools[0]
 
 @dataclass
 class _Run:
@@ -237,8 +265,9 @@ class Agent:
             log.error("LLM error: %s", e)
             trace.warnings.append(f"llm error: {e}")
             response = self._respond(run, "error", [ErrorBlock(message=GENERIC_ERROR_TEXT, retryable=True)])
-        except Exception:
+        except Exception as e:
             log.exception("agent failed on session %s", session_id)
+            trace.warnings.append(f"unhandled: {type(e).__name__}: {e}")
             response = self._respond(run, "error", [ErrorBlock(message=GENERIC_ERROR_TEXT, retryable=True)])
 
         trace.elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -289,6 +318,8 @@ class Agent:
         match decision.intent:
             case Intent.OVERVIEW:
                 return await self._overview_pipeline(run, decision, turn)
+            case Intent.EXPLAIN:
+                return await self._explain_pipeline(run, decision, turn)
             case Intent.FOLLOW_UP:
                 return await self._follow_up(run, decision, turn)
             case Intent.EDIT_CHART:
@@ -355,6 +386,123 @@ class Agent:
         if result.table is not None and result.table.rows:
             blocks.append(TableBlock(id=f"{run.turn_id}-overview", title="Таблицы", data=result.table))
         return self._respond(run, "ok", blocks, narrative.follow_ups)
+
+    async def _explain_pipeline(self, run: _Run, decision: IntentDecision, turn: Turn) -> AgentResponse:
+        question = decision.standalone_question
+        execution = await self._execute(run, Intent.EXPLAIN, question)
+        result = execution.result
+        run.state.set_focus(execution.tables)
+
+        if result.status is ToolStatus.EMPTY or (result.table is not None and not result.table.rows and not result.facts):
+            text = result.summary_text or EMPTY_RESULT_TEXT
+            turn.summary = text
+            return self._respond(run, "ok", [TextBlock(markdown=text)], self._examples(run.catalog))
+
+        await self._status(run, "writing", "Формулирую ответ")
+        narrative, warnings = await narrate(
+            run.llm,
+            question,
+            result,
+            preview_rows=self.config.preview_rows,
+            max_chars=self.config.max_narrative_payload_chars,
+            max_attempts=self.config.per_step_error_budget,
+        )
+        run.trace.warnings.extend(warnings)
+
+        turn.summary = narrative.summary
+        turn.points = narrative.points
+        
+        blocks: list[Block] = [TextBlock(markdown=narrative.summary, points=narrative.points)]
+        if result.table is not None and result.table.rows:
+            blocks.append(TableBlock(id=f"{run.turn_id}-explain", title="Результат", data=result.table))
+            
+        return self._respond(run, "ok", blocks, narrative.follow_ups)
+
+    async def _execute(self, run: _Run, intent: Intent, question: str) -> _ExecutionResult:
+        tools = self.tools.for_intent(intent)
+        if not tools:
+            raise _EarlyReply(
+                "clarification",
+                "Для этого запроса у меня нет подходящего инструмента. Переформулируйте?",
+                self._examples(run.catalog),
+            )
+
+        tool = _pick_explain_tool(tools, question)
+
+        tables = select_tables(
+            question,
+            run.catalog,
+            focus=run.state.focus_tables,
+            max_tables=self.config.max_schema_tables,
+        ) or [t.name for t in run.catalog.tables][: self.config.max_schema_tables]
+        columns = run.catalog.column_refs(tables)
+        schema_doc = render_schema(run.catalog, tables, max_columns=self.config.max_schema_columns)
+
+        args_schema = build_args_schema(tool.args_model, tables=tables, columns=columns)
+        fields = catalog_fields(tool.args_model)
+
+        system_prompt = (
+            f"Ты формируешь аргументы для инструмента «{tool.name}».\n"
+            f"{tool.description}\n\n"
+            f"Подсказки по аргументам:\n{tool.args_hint or '(нет)'}\n\n"
+            f"Схема данных:\n{schema_doc}\n\n"
+            "Верни JSON-объект с аргументами строго по схеме."
+        )
+
+        def _preprocess(data: dict) -> dict:
+            data = fix_catalog_refs(data, fields, tables, columns)
+            return tool.preprocess_args(data, run.catalog)
+
+        try:
+            args = await generate_structured(
+                run.llm,
+                [system_msg(system_prompt), user_msg(question)],
+                tool.args_model,
+                schema=args_schema,
+                schema_name=f"args_{tool.name}",
+                max_attempts=self.config.per_step_error_budget,
+                preprocess=_preprocess,
+            )
+        except StructuredOutputError as e:
+            run.trace.warnings.append(f"args for {tool.name} failed: {e.errors}")
+            raise _EarlyReply(
+                "clarification",
+                "Не получилось понять, к какому полю относится вопрос. Уточните, пожалуйста.",
+                self._examples(run.catalog),
+            )
+
+        ctx = ToolContext(run.catalog, self.executor, run.session_id, question, run.llm)
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(
+                tool.run(args, ctx), self.config.tool_timeout_s
+            )
+        except TimeoutError:
+            raise _EarlyReply(
+                "error",
+                "Инструмент не успел ответить. Попробуйте ещё раз.",
+                retryable=True,
+            )
+
+        run.trace.tool_calls.append(
+            ToolCallTrace(
+                tool=tool.name,
+                args=args.model_dump(mode="json", exclude_none=True),
+                status=result.status.value,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                error=result.error,
+            )
+        )
+
+        used: list[str] = []
+        raw = args.model_dump(mode="json", exclude_none=True)
+        for value in raw.values():
+            for v in value if isinstance(value, list) else [value]:
+                if isinstance(v, str):
+                    candidate = v.split(".", 1)[0]
+                    if run.catalog.table(candidate) is not None:
+                        used.append(candidate)
+        return _ExecutionResult(result=result, tables=list(dict.fromkeys(used)) or tables)
 
     async def _chart_pipeline(
         self,

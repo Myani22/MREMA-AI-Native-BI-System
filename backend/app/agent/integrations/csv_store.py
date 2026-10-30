@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import re
+import statistics
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -73,11 +74,34 @@ def _convert(value: str, kind: str) -> Any:
     return v
 
 
-def _sniff(text: str) -> csv.Dialect | type[csv.Dialect]:
-    try:
-        return csv.Sniffer().sniff(text[:20000], delimiters=",;\t|")
-    except csv.Error:
-        return csv.excel
+def _detect_delimiter(text: str) -> str:
+    """Определяет разделитель CSV. Приоритет: ; > \\t > | > ,
+    
+    Разделитель валиден только если он встречается одинаковое число раз
+    в каждой непустой строке (консистентность). Запятая — всегда последняя,
+    т.к. часто встречается внутри чисел («298,70», «1,5»).
+    """
+    lines = [line for line in text.splitlines()[:30] if line.strip()]
+    if not lines:
+        return ","
+
+    # Стабильные кандидаты в порядке приоритета (без запятой)
+    for delim in (";", "\t", "|"):
+        counts = [line.count(delim) for line in lines]
+        if counts[0] > 0 and len(set(counts)) == 1:
+            return delim
+
+    # Запятая — только если стабильна
+    comma_counts = [line.count(",") for line in lines]
+    if comma_counts[0] > 0 and len(set(comma_counts)) == 1:
+        return ","
+
+    # Fallback: ни один не стабилен — берём по приоритету первый встречающийся
+    for delim in (";", "\t", "|", ","):
+        if any(line.count(delim) > 0 for line in lines):
+            return delim
+
+    return ","
 
 
 def _decode(raw: bytes) -> str:
@@ -106,7 +130,7 @@ class LoadedTable:
 
 def parse_csv(raw: bytes, filename: str) -> LoadedTable:
     text = _decode(raw)
-    reader = csv.reader(io.StringIO(text), _sniff(text))
+    reader = csv.reader(io.StringIO(text), delimiter=_detect_delimiter(text))
     header = next(reader, None)
     if not header:
         raise ValueError(f"файл {filename} пуст")
@@ -152,6 +176,15 @@ def _semantic(name: str, kind: str, distinct: int, non_null: int, has_time: bool
         return SemanticType.CATEGORY
     return SemanticType.TEXT
 
+def _percentile(sorted_values: list[float], pct: float) -> float:
+    if not sorted_values:
+        raise ValueError("пустой список")
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    k = (len(sorted_values) - 1) * (pct / 100.0)
+    lo = int(k)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * (k - lo)
 
 def _fmt(value: Any) -> str:
     if isinstance(value, float):
@@ -220,6 +253,15 @@ class InMemoryCsvStore:
             )
             if kind in ("int", "float", "date") and values and semantic is not SemanticType.ID:
                 info.min_value, info.max_value = _fmt(min(values)), _fmt(max(values))
+            if kind in ("int", "float") and values and semantic is not SemanticType.ID:
+                try:
+                    numeric = sorted(float(v) for v in values)
+                    info.mean_value = _fmt(statistics.mean(numeric))
+                    info.median_value = _fmt(statistics.median(numeric))
+                    info.p25_value = _fmt(_percentile(numeric, 25))
+                    info.p75_value = _fmt(_percentile(numeric, 75))
+                except (TypeError, ValueError):
+                    pass
             if semantic in (SemanticType.CATEGORY, SemanticType.BOOLEAN, SemanticType.TEXT):
                 info.top_values = [ValueCount(value=_fmt(v), count=n) for v, n in counts.most_common(10)]
             columns.append(info)
