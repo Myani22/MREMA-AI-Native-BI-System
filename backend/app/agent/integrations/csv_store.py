@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import re
+import statistics
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -152,6 +153,15 @@ def _semantic(name: str, kind: str, distinct: int, non_null: int, has_time: bool
         return SemanticType.CATEGORY
     return SemanticType.TEXT
 
+def _percentile(sorted_values: list[float], pct: float) -> float:
+    if not sorted_values:
+        raise ValueError("пустой список")
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    k = (len(sorted_values) - 1) * (pct / 100.0)
+    lo = int(k)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * (k - lo)
 
 def _fmt(value: Any) -> str:
     if isinstance(value, float):
@@ -220,6 +230,15 @@ class InMemoryCsvStore:
             )
             if kind in ("int", "float", "date") and values and semantic is not SemanticType.ID:
                 info.min_value, info.max_value = _fmt(min(values)), _fmt(max(values))
+            if kind in ("int", "float") and values and semantic is not SemanticType.ID:
+                try:
+                    numeric = sorted(float(v) for v in values)
+                    info.mean_value = _fmt(statistics.mean(numeric))
+                    info.median_value = _fmt(statistics.median(numeric))
+                    info.p25_value = _fmt(_percentile(numeric, 25))
+                    info.p75_value = _fmt(_percentile(numeric, 75))
+                except (TypeError, ValueError):
+                    pass
             if semantic in (SemanticType.CATEGORY, SemanticType.BOOLEAN, SemanticType.TEXT):
                 info.top_values = [ValueCount(value=_fmt(v), count=n) for v, n in counts.most_common(10)]
             columns.append(info)
