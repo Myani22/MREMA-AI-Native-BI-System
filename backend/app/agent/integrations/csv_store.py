@@ -74,11 +74,34 @@ def _convert(value: str, kind: str) -> Any:
     return v
 
 
-def _sniff(text: str) -> csv.Dialect | type[csv.Dialect]:
-    try:
-        return csv.Sniffer().sniff(text[:20000], delimiters=",;\t|")
-    except csv.Error:
-        return csv.excel
+def _detect_delimiter(text: str) -> str:
+    """Определяет разделитель CSV. Приоритет: ; > \\t > | > ,
+    
+    Разделитель валиден только если он встречается одинаковое число раз
+    в каждой непустой строке (консистентность). Запятая — всегда последняя,
+    т.к. часто встречается внутри чисел («298,70», «1,5»).
+    """
+    lines = [line for line in text.splitlines()[:30] if line.strip()]
+    if not lines:
+        return ","
+
+    # Стабильные кандидаты в порядке приоритета (без запятой)
+    for delim in (";", "\t", "|"):
+        counts = [line.count(delim) for line in lines]
+        if counts[0] > 0 and len(set(counts)) == 1:
+            return delim
+
+    # Запятая — только если стабильна
+    comma_counts = [line.count(",") for line in lines]
+    if comma_counts[0] > 0 and len(set(comma_counts)) == 1:
+        return ","
+
+    # Fallback: ни один не стабилен — берём по приоритету первый встречающийся
+    for delim in (";", "\t", "|", ","):
+        if any(line.count(delim) > 0 for line in lines):
+            return delim
+
+    return ","
 
 
 def _decode(raw: bytes) -> str:
@@ -107,7 +130,7 @@ class LoadedTable:
 
 def parse_csv(raw: bytes, filename: str) -> LoadedTable:
     text = _decode(raw)
-    reader = csv.reader(io.StringIO(text), _sniff(text))
+    reader = csv.reader(io.StringIO(text), delimiter=_detect_delimiter(text))
     header = next(reader, None)
     if not header:
         raise ValueError(f"файл {filename} пуст")
