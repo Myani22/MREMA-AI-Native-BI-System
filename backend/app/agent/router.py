@@ -151,6 +151,7 @@ class IntentRouter:
     async def classify(self, message: str, state: SessionState, catalog: Catalog) -> IntentDecision:
         allowed = [
             Intent.OVERVIEW,
+            Intent.EXPLAIN,
             Intent.CHART,
             Intent.EDIT_CHART,
             Intent.META_UNCLEAR,
