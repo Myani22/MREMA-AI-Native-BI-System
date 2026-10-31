@@ -13,6 +13,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from .calculation import describe_calculation, is_complex
 from .config import AgentConfig
 from .contracts.catalog import TIME_TYPES, Catalog, CatalogProvider, QueryExecutor, SemanticType
 from .contracts.dashboard import Dashboard, DashboardStore, DashboardWidget
@@ -42,7 +43,7 @@ from .error_budget import ErrorBudget
 from .integrations.basic_tools import NoArgs, OverviewTool
 from .integrations.charts import SUPPORTED_CHART_TYPES
 from .integrations.dsl_exec import DslRunError, DslRunner
-from .integrations.query_dsl import QueryArgs, QueryDslTool, to_result_table
+from .integrations.query_dsl import LimitArg, QueryArgs, QueryDslTool, to_result_table
 from .intents import Intent
 from .llm.client import ChatMessage, LLMClient, LLMReply, system_msg, user_msg
 from .llm.errors import LLMError, LLMUnavailableError, StructuredOutputError
@@ -75,12 +76,15 @@ from .integrations.dsl_edit import (
     apply_limit_to_dsl, apply_sort_to_dsl,
     detect_limit_request, detect_sort_request, resolve_column_name,
 )
+from .downsample import downsample_for_chart
+
 
 log = logging.getLogger(__name__)
 
 EventSink = Callable[[StreamEvent], Awaitable[None]]
 ResponseStatus = Literal["ok", "clarification", "refused", "error"]
 
+RANKING_ROWS = 50
 _DASHBOARD_HINT_RE = re.compile(
     r"дашборд|панел[ьиейя]|dashboard|нескольк\w*\s+(график|диаграмм|виджет)", re.I
 )
@@ -741,17 +745,23 @@ class Agent:
             if spec is None:
                 spec = ChartSpec(chart_type=ChartType.TABLE, title=item.title)
 
+            engine_args = args.to_engine()
+            calculation = describe_calculation(engine_args) if is_complex(engine_args) else []
+            ranking = await self._ranking(args, ctx, runner) if calculation else None
+
             charts.append(
                 ChartMicrosession(
                     id=_new_id(),
                     question=item.purpose or question,
                     chart_type=spec.chart_type,
                     chart_spec=spec,
-                    chart_args=args.to_engine(),
+                    chart_args=engine_args,
                     table=table,
                     note=note,
                     summary="",
                     points=[],
+                    calculation=calculation,
+                    ranking=ranking,
                     created_at=_now(),
                 )
             )
@@ -993,19 +1003,45 @@ class Agent:
             return None
         return ChartBlock(id=block_id, spec=spec, data=data, note=note, engine_spec=engine_spec)
 
+    async def _ranking(self, args: QueryArgs, ctx: ToolContext, runner: DslRunner) -> ResultTable | None:
+        last = args.steps[-1]
+        if not isinstance(last, LimitArg) or last.n > 5 or len(args.steps) < 2:
+            return None
+        full = args.model_copy(update={"steps": args.steps[:-1], "output": args.steps[-2].var})
+        try:
+            outcome = await asyncio.wait_for(runner.run(full, ctx, max_rows=RANKING_ROWS), self.config.tool_timeout_s)
+        except (DslRunError, TimeoutError):
+            return None
+        if len(outcome.rows) <= last.n:
+            return None
+        return to_result_table(outcome.rows, outcome.schema, RANKING_ROWS)
+
     def _micro_blocks(self, micro: ChartMicrosession) -> list[Block]:
         table = micro.table
         if not table.rows:
             return []
+        
         spec = micro.chart_spec
         blocks: list[Block] = []
         chart_block = None
+        
         if spec.chart_type is not ChartType.TABLE:
-            chart_block = self._chart_block(f"{micro.id}-chart", spec, table, micro.note)
-        if chart_block is not None:
-            blocks.append(chart_block)
-        if chart_block is None or chart_block.spec.chart_type is not ChartType.KPI:
-            blocks.append(TableBlock(id=f"{micro.id}-table", title=spec.title, data=table))
+            chart_table, chart_spec, is_sampled = downsample_for_chart(table, spec)
+            chart_block = self._chart_block(f"{micro.id}-chart", chart_spec, chart_table, micro.note)
+            if chart_block is not None:
+                blocks.append(chart_block)
+                
+        table_spec = ChartSpec(chart_type=ChartType.TABLE, title=spec.title)
+        grid_table, _, _ = downsample_for_chart(table, table_spec)
+
+        if chart_block is None or chart_block.spec.chart_type is not ChartType.KPI or micro.calculation:
+            blocks.append(TableBlock(id=f"{micro.id}-table", title=spec.title, data=grid_table))
+            
+        if micro.calculation:
+            blocks.append(TextBlock(markdown="**Как считали**", points=micro.calculation))
+            
+        if micro.ranking is not None:
+            blocks.append(TableBlock(id=f"{micro.id}-ranking", title="Все значения", data=micro.ranking))
         return blocks
 
     def _respond(

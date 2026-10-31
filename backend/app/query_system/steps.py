@@ -9,10 +9,12 @@ from typing import Any
 from app.query_system.conditions import (
     NUMERIC_TYPES,
     ORDERABLE_TYPES,
+    TIME_TYPES,
     Condition,
     ValidationError,
     normalize_runtime_value,
 )
+from app.query_system.expressions import ExpressionError, Node, evaluate, infer_type, parse_expression
 
 
 class Table:
@@ -89,7 +91,7 @@ STEP_REGISTRY: dict[str, type[Step]] = {}
 
 VALID_SORT_DIRS: frozenset[str] = frozenset({"asc", "desc"})
 VALID_JOIN_TYPES: frozenset[str] = frozenset({"inner", "left", "right"})
-VALID_AGG_FUNCS: frozenset[str] = frozenset({"count", "count_distinct", "sum", "avg", "min", "max"})
+VALID_AGG_FUNCS: frozenset[str] = frozenset({"count", "count_distinct", "sum", "avg", "min", "max", "median", "percentile"})
 
 
 def register_step(op_name: str) -> Callable[[type[Step]], type[Step]]:
@@ -853,13 +855,23 @@ class AggregateSpec:
     func: str
     column: str
     alias: str
+    p: float | None = None
 
-    def to_dict(self) -> dict[str, str]:
-        return {
+    @property
+    def quantile(self) -> float:
+        if self.func == "median" or self.p is None:
+            return 0.5
+        return self.p / 100 if self.p > 1 else self.p
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "func": self.func,
             "column": self.column,
             "alias": self.alias,
         }
+        if self.p is not None:
+            payload["p"] = self.p
+        return payload
 
 
 @register_step("aggregate")
@@ -1006,7 +1018,20 @@ class AggregateStep(Step):
                         )
                     else:
                         col_type = in_schema[agg.column]
-                        if agg.func in {"sum", "avg"}:
+                        if agg.func == "percentile" and (
+                            not isinstance(agg.p, int | float) or isinstance(agg.p, bool) or not 0 < agg.p <= 100
+                        ):
+                            local_errors.append(
+                                ValidationError(
+                                    step_index=step_index,
+                                    var=self.var,
+                                    reason="invalid_parameter",
+                                    field=f"aggregates[{idx}].p",
+                                    value=str(agg.p),
+                                    valid_options=["0.9", "0.95", "0.5"],
+                                )
+                            )
+                        if agg.func in {"sum", "avg", "median", "percentile"}:
                             if col_type not in NUMERIC_TYPES:
                                 local_errors.append(
                                     ValidationError(
@@ -1020,10 +1045,10 @@ class AggregateStep(Step):
                                 )
                             elif agg.alias:
                                 out_schema[agg.alias] = (
-                                    "float" if agg.func == "avg" else col_type
+                                    col_type if agg.func == "sum" else "float"
                                 )
                         elif agg.func in {"min", "max"}:
-                            allowed = NUMERIC_TYPES | {"date"}
+                            allowed = NUMERIC_TYPES | TIME_TYPES
                             if col_type not in allowed:
                                 local_errors.append(
                                     ValidationError(
@@ -1196,11 +1221,13 @@ class AggregateStep(Step):
                         )
                     )
 
+                raw_p = item.get("p")
                 aggs.append(
                     AggregateSpec(
                         func=func_str,
                         column=col_str,
                         alias=alias_str,
+                        p=raw_p if isinstance(raw_p, int | float) and not isinstance(raw_p, bool) else None,
                     )
                 )
 
@@ -1631,8 +1658,139 @@ def _compute_aggregate(agg: AggregateSpec, rows: list[dict[str, Any]]) -> Any:
         return sum(vals)
     if agg.func == "avg":
         return sum(vals) / len(vals)
+    if agg.func in {"median", "percentile"}:
+        return _percentile_cont(sorted(vals), agg.quantile)
     if agg.func == "min":
         return min(vals, key=normalize_runtime_value)
     if agg.func == "max":
         return max(vals, key=normalize_runtime_value)
     raise ValueError(f"Unsupported aggregate function: {agg.func}")
+
+def _percentile_cont(values: list[Any], q: float) -> float:
+    if len(values) == 1:
+        return float(values[0])
+    k = (len(values) - 1) * q
+    lo = int(k)
+    hi = min(lo + 1, len(values) - 1)
+    return float(values[lo] + (values[hi] - values[lo]) * (k - lo))
+
+
+@dataclass(frozen=True)
+class DerivedColumn:
+    name: str
+    expr: str
+    node: Node | None = field(default=None, compare=False, repr=False)
+    error: str | None = field(default=None, compare=False, repr=False)
+
+    def to_dict(self) -> dict[str, str]:
+        return {"name": self.name, "expr": self.expr}
+
+
+@register_step("derive")
+@dataclass(frozen=True)
+class DeriveStep(Step):
+    var: str
+    input: str
+    columns: tuple[DerivedColumn, ...]
+    parse_errors: tuple[ValidationError, ...] = field(default=(), repr=False)
+
+    @property
+    def input_refs(self) -> tuple[tuple[str, str], ...]:
+        return (("input", self.input),)
+
+    def validate(
+        self,
+        input_schemas: dict[str, dict[str, str]],
+        schema: dict[str, dict[str, str]],
+        errors: list[ValidationError] | None = None,
+        step_index: int = 0,
+    ) -> dict[str, str]:
+        local_errors: list[ValidationError] = [
+            err.with_context(step_index, self.var) for err in self.parse_errors
+        ]
+        in_schema = input_schemas.get(self.input)
+        out_schema = dict(in_schema or {})
+        for idx, col in enumerate(self.columns):
+            if col.error is not None or col.node is None:
+                local_errors.append(
+                    ValidationError(step_index, self.var, "invalid_parameter", f"columns[{idx}].expr", col.error or col.expr)
+                )
+                continue
+            if in_schema is None:
+                continue
+            if not col.name or col.name in out_schema:
+                local_errors.append(
+                    ValidationError(step_index, self.var, "invalid_parameter", f"columns[{idx}].name", col.name or None)
+                )
+                continue
+            try:
+                kind = infer_type(col.node, out_schema)
+            except ExpressionError as e:
+                local_errors.append(
+                    ValidationError(
+                        step_index,
+                        self.var,
+                        "invalid_parameter",
+                        f"columns[{idx}].expr",
+                        f"{col.expr}: {e}",
+                        sorted(out_schema) if "нет колонки" in str(e) else None,
+                    )
+                )
+                continue
+            out_schema[col.name] = "float" if kind == "null" else "str" if kind == "timestr" else kind
+
+        if errors is not None:
+            errors.extend(local_errors)
+        if local_errors or in_schema is None:
+            return {}
+        return out_schema
+
+    def execute(
+        self,
+        env: dict[str, Table],
+        sources: Mapping[str, Any],
+    ) -> Table:
+        source_table = env[self.input]
+        out_columns = [*source_table.columns, *(c.name for c in self.columns)]
+        rows: list[dict[str, Any]] = []
+        for row in source_table.rows:
+            current = dict(row)
+            for col in self.columns:
+                current[col.name] = evaluate(col.node, current)
+            rows.append(current)
+        return Table(out_columns, rows)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "var": self.var,
+            "op": "derive",
+            "input": self.input,
+            "columns": [c.to_dict() for c in self.columns],
+        }
+
+    @classmethod
+    def _parse(
+        cls,
+        var: str,
+        data: Mapping[str, Any],
+        parse_errors: list[ValidationError],
+    ) -> Step:
+        input_var = _parse_input_field(var, data, "input", parse_errors)
+        raw_columns = data.get("columns")
+        columns: list[DerivedColumn] = []
+        if not isinstance(raw_columns, list) or not raw_columns:
+            parse_errors.append(
+                ValidationError(0, var, "invalid_parameter", "columns", str(raw_columns) if raw_columns is not None else None)
+            )
+        else:
+            for item in raw_columns:
+                if not isinstance(item, Mapping):
+                    columns.append(DerivedColumn("", str(item), None, "ожидается {name, expr}"))
+                    continue
+                name = item.get("name") if isinstance(item.get("name"), str) else ""
+                expr = item.get("expr") if isinstance(item.get("expr"), str) else ""
+                try:
+                    columns.append(DerivedColumn(name.strip(), expr, parse_expression(expr)))
+                except ExpressionError as e:
+                    columns.append(DerivedColumn(name.strip(), expr, None, f"{expr}: {e}"))
+        return cls(var=var, input=input_var, columns=tuple(columns), parse_errors=tuple(parse_errors))

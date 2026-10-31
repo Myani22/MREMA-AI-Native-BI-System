@@ -15,7 +15,7 @@ from .llm.client import ChatMessage, LLMClient, system_msg, user_msg
 from .llm.errors import StructuredOutputError
 from .llm.structured import generate_structured
 from .pipeline_validator import validate_chart_pipeline
-from .prompts import DSL_EXAMPLES_BY_TYPE, DSL_FEEDBACK, DSL_SYSTEM
+from .prompts import DSL_EXAMPLES_BY_TYPE, DSL_FEEDBACK, DSL_SYSTEM, RECIPE_GROWTH
 from .schema_linking import render_schema
 
 _engine = QueryEngine()
@@ -55,6 +55,7 @@ def _messages(
         purpose=purpose or title,
         schema=schema_text,
         example_json=json.dumps(example_dict, ensure_ascii=False),
+        recipe_growth=json.dumps(RECIPE_GROWTH, ensure_ascii=False),
     )
     user_content = f"Заголовок графика: «{title}».\nВопрос: {question}\nНазначение: {purpose or title}"
     if original_dsl is not None:

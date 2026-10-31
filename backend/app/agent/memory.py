@@ -28,6 +28,8 @@ class ChartMicrosession(BaseModel):
     note: str | None = None
     summary: str = ""
     points: list[str] = Field(default_factory=list)
+    calculation: list[str] = Field(default_factory=list)
+    ranking: ResultTable | None = None
     created_at: datetime = Field(default_factory=_now)
 
 

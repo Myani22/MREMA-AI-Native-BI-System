@@ -66,14 +66,14 @@ CAPABILITIES: Capabilities = Capabilities(
         "Чтение таблиц каталога (source) и проекция нужного подмножества колонок (select).",
         "Фильтрация строк (filter) с использованием простых предикатов и логических комбинаторов (and, or, not).",
         "Соединение двух таблиц или промежуточных переменных (join) по одному или нескольким ключам (inner, left, right).",
-        "Группировка и агрегация данных (aggregate: count, sum, avg, min, max) с пост-фильтрацией агрегатов через having.",
+        "Группировка и агрегация данных (aggregate: count, count_distinct, sum, avg, min, max, median, percentile) с пост-фильтрацией агрегатов через having.",
+        "Вычисляемые колонки (derive): арифметика, условия if, разница дат date_diff, части дат, greatest/least/coalesce.",
         "Сортировка по одной или нескольким колонкам (sort), удаление дубликатов (distinct) и ограничение числа строк (limit).",
     ],
     unsupported=[
         "Подзапросы внутри filter (IN SELECT / EXISTS) — ломают линейность конвейера; вместо них используй отдельный шаг и join.",
         "Оконные функции (OVER, PARTITION BY, ROW_NUMBER, LAG/LEAD) — не поддерживаются табличным движком, вне рамок модели исполнения.",
         "Объединение множеств (UNION / INTERSECT / EXCEPT) — нарушает правило единственного двухвходового оператора join.",
-        "Условные выражения и вычисляемые колонки (CASE WHEN, арифметика в select) — шаг select выполняет только чистую проекцию существующих колонок.",
         "Именованные табличные выражения (CTE / WITH) и рекурсивные запросы — заменены линейной системой переменных var.",
         "Модификация данных и схемы (INSERT, UPDATE, DELETE, DROP, ALTER) — движок предназначен исключительно для аналитического чтения (read-only).",
     ],
@@ -212,9 +212,9 @@ STEPS: list[StepSpec] = [
             ),
             ParamSpec(
                 name="aggregates",
-                type='list[{func: "count"|"sum"|"avg"|"min"|"max", column: str, alias: str}]',
+                type='list[{func: "count"|"count_distinct"|"sum"|"avg"|"min"|"max"|"median"|"percentile", column: str, alias: str, p?: float}]',
                 required=True,
-                description="Непустой список агрегатов; для count допустим column='*', sum/avg требуют числовых колонок, min/max — числовых или date",
+                description="Непустой список агрегатов; для count допустим column='*', sum/avg/median/percentile требуют числовых колонок, min/max — числовых или дат; percentile требует p (доля 0..1, например 0.9)",
             ),
             ParamSpec(
                 name="having",
@@ -232,6 +232,39 @@ STEPS: list[StepSpec] = [
                 {"func": "sum", "column": "amount", "alias": "total_amount"}
             ],
             "having": {"column": "total_amount", "cmp": "gt", "value": 100},
+        },
+    ),
+    StepSpec(
+        name="derive",
+        description=(
+            "Добавляет вычисляемые колонки по формулам, число строк не меняется. Колонки в формуле пиши в квадратных скобках: [Цена]. "
+            "Операции: + - * /, сравнения = != < > <= >=, and, or, not, is null. Строки и даты в одинарных кавычках: 'Доставлено', '2025-03-01'. "
+            "Функции: date_diff('hour'|'day'|'minute', начало, конец), date_trunc('month', дата), month(дата), year(дата), day(дата), hour(дата), "
+            "days_in_month(дата), greatest(a, b), least(a, b), coalesce(a, b), if(условие, a, b), abs(x), round(x, 2). "
+            "Деление на ноль даёт пусто. Следующая колонка шага может ссылаться на предыдущую."
+        ),
+        parameters=[
+            ParamSpec(
+                name="input",
+                type="str",
+                required=True,
+                description="Имя переменной, определённой выше",
+            ),
+            ParamSpec(
+                name="columns",
+                type="list[{name: str, expr: str}]",
+                required=True,
+                description="Новые колонки: имя и формула",
+            ),
+        ],
+        example={
+            "var": "D1",
+            "op": "derive",
+            "input": "T1",
+            "columns": [
+                {"name": "Сумма", "expr": "[Количество] * [Цена]"},
+                {"name": "Часы решения", "expr": "date_diff('hour', [Создано], [Закрыто])"},
+            ],
         },
     ),
     StepSpec(
@@ -627,7 +660,7 @@ def _format_step_pseudo(data: Mapping[str, Any]) -> str:
     if op == "aggregate":
         gb = ", ".join(data.get("group_by", []))
         aggs = ", ".join(
-            f"{a['func']}({a['column']}) as {a['alias']}"
+            f"{a['func']}({a['column']}{', ' + str(a['p']) if a.get('p') is not None else ''}) as {a['alias']}"
             for a in data.get("aggregates", [])
         )
         base = f"{var} = aggregate({data.get('input', '')}, group_by=[{gb}], [{aggs}]"
@@ -635,6 +668,9 @@ def _format_step_pseudo(data: Mapping[str, Any]) -> str:
             having_str = _format_condition_pseudo(data["having"])
             return f"{base}, having=({having_str}))"
         return f"{base})"
+    if op == "derive":
+        cols = ", ".join(f"{c.get('name', '')} = {c.get('expr', '')}" for c in data.get("columns", []))
+        return f"{var} = derive({data.get('input', '')}, {cols})"
     if op == "distinct":
         return f"{var} = distinct({data.get('input', '')})"
     if op == "join":

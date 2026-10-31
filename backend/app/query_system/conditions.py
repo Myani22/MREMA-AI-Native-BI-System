@@ -7,10 +7,12 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
+from app.query_system.dates import align, parse_literal
 
-VALID_SCHEMA_TYPES: frozenset[str] = frozenset({"int", "float", "str", "date", "bool"})
+VALID_SCHEMA_TYPES: frozenset[str] = frozenset({"int", "float", "str", "date", "datetime", "bool"})
 NUMERIC_TYPES: frozenset[str] = frozenset({"int", "float"})
-ORDERABLE_TYPES: frozenset[str] = frozenset({"int", "float", "date", "str"})
+ORDERABLE_TYPES: frozenset[str] = frozenset({"int", "float", "date", "datetime", "str"})
+TIME_TYPES: frozenset[str] = frozenset({"date", "datetime"})
 
 SCALAR_COMPARISONS: frozenset[str] = frozenset({"eq", "ne", "gt", "lt", "ge", "le"})
 ORDERING_COMPARISONS: frozenset[str] = frozenset({"gt", "lt", "ge", "le", "between"})
@@ -461,32 +463,24 @@ class ComparisonCondition(Condition):
 
         cell = normalize_runtime_value(raw_cell)
 
-        if self.cmp == "eq":
-            return cell == normalize_runtime_value(self.value)
-        if self.cmp == "ne":
-            return cell != normalize_runtime_value(self.value)
-        if self.cmp == "gt":
-            return cell > normalize_runtime_value(self.value)
-        if self.cmp == "lt":
-            return cell < normalize_runtime_value(self.value)
-        if self.cmp == "ge":
-            return cell >= normalize_runtime_value(self.value)
-        if self.cmp == "le":
-            return cell <= normalize_runtime_value(self.value)
-        if self.cmp == "in":
-            targets = [
-                normalize_runtime_value(v) for v in (self.values or ())
-            ]
-            return cell in targets
-        if self.cmp == "not_in":
-            targets = [
-                normalize_runtime_value(v) for v in (self.values or ())
-            ]
-            return cell not in targets
+        if self.cmp in SCALAR_COMPARISONS:
+            left, right = align(cell, normalize_runtime_value(self.value))
+            try:
+                return _SCALAR_OPS[self.cmp](left, right)
+            except TypeError:
+                return False
+        if self.cmp in SET_COMPARISONS:
+            targets = [align(cell, normalize_runtime_value(v)) for v in (self.values or ())]
+            found = any(a == b for a, b in targets)
+            return found if self.cmp == "in" else not found
         if self.cmp == "between":
-            low = normalize_runtime_value(self.min_value)
-            high = normalize_runtime_value(self.max_value)
-            return low <= cell <= high
+            left, low = align(cell, normalize_runtime_value(self.min_value))
+            left, high = align(left, normalize_runtime_value(self.max_value))
+            low, _ = align(low, left)
+            try:
+                return low <= left <= high
+            except TypeError:
+                return False
         if self.cmp == "like":
             if not isinstance(raw_cell, str) or not isinstance(self.pattern, str):
                 return False
@@ -621,17 +615,30 @@ def is_value_compatible(value: Any, schema_type: str) -> bool:
                 return False
         return False
 
+    if schema_type == "datetime":
+        if isinstance(value, date):
+            return True
+        return isinstance(value, str) and parse_literal(value) is not None
+
     return False
 
 
 def normalize_runtime_value(value: Any) -> Any:
     """Normalize runtime values so ISO date strings and date objects compare consistently."""
-    if isinstance(value, str) and len(value) == 10 and value[4] == "-" and value[7] == "-":
-        try:
-            return date.fromisoformat(value)
-        except ValueError:
-            return value
+    if isinstance(value, str) and len(value) >= 10 and value[4:5] == "-" and value[7:8] == "-":
+        parsed = parse_literal(value)
+        return value if parsed is None else parsed
     return value
+
+
+_SCALAR_OPS = {
+    "eq": lambda a, b: a == b,
+    "ne": lambda a, b: a != b,
+    "gt": lambda a, b: a > b,
+    "lt": lambda a, b: a < b,
+    "ge": lambda a, b: a >= b,
+    "le": lambda a, b: a <= b,
+}
 
 
 def _like_to_regex(pattern: str) -> re.Pattern[str]:

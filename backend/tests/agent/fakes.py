@@ -181,17 +181,12 @@ class SqlTool(BaseTool):
         )
 
 
-def intent(
-    intent_value: str,
-    question: str = "вопрос",
-    confidence: float = 0.9,
-    **extra: Any,
-) -> dict[str, Any]:
+def intent(name: str, question: str, wants_explanation: bool = False, **kwargs) -> dict:
     return {
+        "intent": name,
         "standalone_question": question,
-        "intent": intent_value,
-        "confidence": confidence,
-        **extra,
+        "wants_explanation": wants_explanation,
+        **kwargs
     }
 
 
