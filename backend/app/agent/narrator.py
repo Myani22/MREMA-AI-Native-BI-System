@@ -12,7 +12,8 @@ from pydantic import BaseModel, Field
 
 from .contracts.tools import ToolResult
 from .llm.client import LLMClient, assistant_msg, system_msg, user_msg
-from .llm.structured import generate_structured
+from .llm.errors import StructuredOutputError
+from .llm.structured import generate_structured, extract_json
 from .prompts import (
     DASHBOARD_NARRATOR_SYSTEM,
     GROUNDING_FEEDBACK,
@@ -34,6 +35,10 @@ _SCALES = (1.0, 100.0, 1e-3, 1e-6, 1e-9)
 class Narrative(BaseModel):
     summary: str = Field(description="1–3 предложения с главным выводом")
     points: list[str] = Field(default_factory=list, max_length=5)
+    hypothesis: str = Field(
+        default="", 
+        description="Аналитическое предположение о причинах. БЕЗ ЦИФР. Используй мягкие формулировки ('Возможно...', 'Вероятно...')."
+    )
     follow_ups: list[str] = Field(default_factory=list, max_length=3)
 
 
@@ -136,6 +141,11 @@ def _filter_follow_ups(follow_ups: list[str], payload_text: str) -> list[str]:
             
     return valid[:3]
 
+
+def _has_any_digits(text: str) -> bool:
+    return bool(re.search(r'\d', text))
+
+
 async def narrate(
     llm: LLMClient,
     question: str,
@@ -148,31 +158,95 @@ async def narrate(
 ) -> tuple[Narrative, list[str]]:
     payload = build_payload(result, preview_rows, max_chars)
     payload_text = json.dumps(payload, ensure_ascii=False, default=str)
+    
+    system_prompt = NARRATOR_SYSTEM + (
+        "\n- hypothesis: одно предложение с предположением о причинах таких цифр. "
+        "ВАЖНО: В гипотезе НЕ ДОЛЖНО БЫТЬ ЦИФР ВООБЩЕ. Только качественная оценка "
+        "(например, \"Вероятно, это связано с сезонным спадом...\")."
+    )
+    
     user_content = NARRATOR_USER.format(question=question, payload=payload_text)
     if focus:
         user_content += NARRATOR_FOCUS.format(focus=focus)
-    messages = [system_msg(NARRATOR_SYSTEM), user_msg(user_content)]
+        
+    messages = [system_msg(system_prompt), user_msg(user_content)]
     warnings: list[str] = []
     
-    narrative = await generate_structured(
-        llm, messages, Narrative, schema_name="narrative", max_attempts=max_attempts, temperature=0.2
-    )
-    bad = ungrounded_numbers(" ".join([narrative.summary, *narrative.points]), payload)
-    
-    if not bad:
-        filtered_follow_ups = _filter_follow_ups(narrative.follow_ups, payload_text)
-        return Narrative(
-            summary=narrative.summary,
-            points=narrative.points,
-            follow_ups=filtered_follow_ups
-        ), warnings
+    def _validate(n: Narrative) -> list[str]:
+        errors = []
+        text_to_check = " ".join([n.summary, *n.points])
+        bad_nums = ungrounded_numbers(text_to_check, payload)
+        if bad_nums:
+            errors.append(GROUNDING_FEEDBACK.format(numbers=", ".join(bad_nums)))
+        
+        if n.hypothesis and _has_any_digits(n.hypothesis):
+            errors.append("В поле hypothesis найдены цифры. Перепиши гипотезу без числовых данных, только мягкими качественными формулировками.")
+            
+        return errors
 
-    warnings.append(f"числа без опоры на данные: {', '.join(bad)}")
-    log.info("narrative has ungrounded numbers: %s", bad)
-    
-    if result.summary_text:
-        warnings.append("показан шаблонный текст инструмента")
-    return _fallback(result), warnings
+    def _build_final_narrative(summary: str, points: list[str], hypothesis: str, follow_ups: list[str]) -> Narrative:
+        final_summary = summary.strip()
+        if hypothesis.strip():
+            final_summary += f"\n\n*{hypothesis.strip()}*"
+            
+        return Narrative(
+            summary=final_summary, 
+            points=points, 
+            hypothesis=hypothesis, 
+            follow_ups=follow_ups
+        )
+
+    try:
+        narrative = await generate_structured(
+            llm,
+            messages,
+            Narrative,
+            schema_name="narrative",
+            max_attempts=max_attempts,
+            temperature=0.2,
+            validate=_validate,
+        )
+        filtered_follow_ups = _filter_follow_ups(narrative.follow_ups, payload_text)
+        
+        return _build_final_narrative(
+            narrative.summary, 
+            narrative.points, 
+            narrative.hypothesis, 
+            filtered_follow_ups
+        ), warnings
+        
+    except StructuredOutputError as e:
+        warnings.append("сработала фильтрация абзацев из-за галлюцинаций (после цикла самокоррекции)")
+        try:
+            raw_dict = extract_json(e.raw)
+            
+            surviving_summary = raw_dict.get("summary", "")
+            if not surviving_summary or ungrounded_numbers(surviving_summary, payload):
+                surviving_summary = result.summary_text or "Готово, результат ниже."
+
+            surviving_points = []
+            for pt in raw_dict.get("points", []):
+                if isinstance(pt, str) and not ungrounded_numbers(pt, payload):
+                    surviving_points.append(pt)
+                    
+            surviving_hypothesis = raw_dict.get("hypothesis", "")
+            if surviving_hypothesis and _has_any_digits(surviving_hypothesis):
+                surviving_hypothesis = ""
+                
+            follow_ups = _filter_follow_ups(raw_dict.get("follow_ups", []), payload_text)
+            
+            return _build_final_narrative(
+                surviving_summary, 
+                surviving_points, 
+                surviving_hypothesis, 
+                follow_ups
+            ), warnings
+
+        except Exception as parse_err:
+            log.info("narrative fallback parsing failed: %s", parse_err)
+            if result.summary_text:
+                warnings.append("показан шаблонный текст инструмента")
+            return _fallback(result), warnings
 
 
 async def narrate_dashboard(
