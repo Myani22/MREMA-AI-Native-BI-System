@@ -7,6 +7,7 @@ pytest tests/agent                     # тесты агента
 DATA_DIR=../data LLM_BASE_URL=http://localhost:11434/v1 LLM_MODEL=qwen2.5:7b-instruct \
     uvicorn app.api.server:app --reload # API на http://localhost:8000, документация /docs
 python scripts/eval_router.py          # точность определения намерения на живой модели
+python scripts/eval_questions.py       # шесть аналитических вопросов на синтетических данных с эталоном
 ```
 
 `DATA_DIR` — папка с CSV; файлы можно и загрузить через `POST /api/datasets`.
@@ -38,6 +39,7 @@ python scripts/eval_router.py          # точность определения
 | `integrations/sources.py` | Общий каталог: CSV в памяти + таблицы из базы |
 | `integrations/dsl_exec.py` | Проверка запроса по общей схеме и выполнение: в памяти движком, для таблиц из базы через SQL |
 | `integrations/dsl_to_sql.py` | Перевод шагов DSL в SQL для PostgreSQL с теми же правилами, что у движка (суффиксы `_left`/`_right` в join, порядок сортировки) |
+| `calculation.py` | Блок «Как считали»: шаги запроса простым языком для сложных расчётов |
 | `chart_planner.py` | План графиков перед расчётом, если пользователь просит визуализацию |
 | `factory.py` | Сборка агента из всех частей |
 
@@ -105,3 +107,11 @@ API (`app/api/server.py`, документация на `/docs`):
 - `tests/agent/fakes.py`: `ScriptedLLM` отвечает по сценарию; ключ — назначение вызова (`intent_decision`, `args_<инструмент>`, `narrative`, `dashboard_plan`, `tool_choice`). Сквозные сценарии пишутся без GPU, примеры в `tests/agent/test_integrations.py` и `test_api.py`.
 - `trace.llm_calls` и `trace.tool_calls`: задержка, токены, статусы — для сравнения моделей.
 - `scripts/eval_router.py`: точность определения намерения на живой модели; список `CASES` стоит расширять.
+- `tests/analytics/datasets.py`: шесть синтетических наборов (аптеки, продажи, техподдержка, доставка, заявки, фоновые задания) с эталоном на pandas и эталонным DSL. Тесты гоняют эталонный DSL в памяти и в PostgreSQL (`TEST_DATABASE_URL`), `scripts/eval_questions.py [ключ ...]` задаёт те же вопросы живой модели и сверяет ответ.
+
+### Расчётные запросы
+
+- Даты: `app/query_system/dates.py` понимает ISO с `T`, `Z`, миллисекундами и смещением, `дд.мм.гггг`, `дд/мм/гггг` и `мм/дд/гггг` (порядок определяется по колонке), `5 марта 2025`, `март 2025`, `2025-03`. Колонки со временем получают тип `datetime`, время не обрезается.
+- Шаг `derive` добавляет колонки по формулам: `[Количество] * [Цена]`, `date_diff('hour', [Создано], [Закрыто])`, `if(условие, a, b)`, `greatest`, `least`, `coalesce`, `month`, `year`, `day`, `hour`, `days_in_month`, `date_trunc`, `round`, `abs`. Одинаково считается в памяти и переводится в SQL.
+- Агрегаты `median` и `percentile` (`"p": 0.9`), условия `and`/`or`/`not` с одним уровнем вложенности.
+- Пайплайн: `source → filter/derive → aggregate → derive → (aggregate → derive) → sort → limit`; filter после aggregate по-прежнему запрещён, для групп есть `having`.

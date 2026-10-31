@@ -2,6 +2,7 @@ import csv
 import io
 import re
 import uuid
+from datetime import date
 from typing import Any
 
 import pandas as pd
@@ -10,6 +11,7 @@ from sqlalchemy.engine import Engine
 
 from app.db import SessionLocal
 from app.models import Dataset
+from app.query_system.dates import infer_date_parser
 
 
 def _fit_identifier(name: str, limit: int = 63) -> str:
@@ -73,32 +75,24 @@ def _detect_delimiter(content: bytes) -> str:
     return ","
 
 
-_DATE_FORMATS = (
-    (re.compile(r"^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$"), None),
-    (re.compile(r"^\d{2}\.\d{2}\.\d{4}$"), "%d.%m.%Y"),
-    (re.compile(r"^\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}(:\d{2})?$"), "mixed"),
-)
-
-
 def _parse_dates(df: pd.DataFrame, min_share: float = 0.95) -> pd.DataFrame:
     for column in df.columns:
         series = df[column]
         if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
             continue
         values = series.dropna().astype(str).str.strip()
-        if values.empty:
+        values = values[values != ""]
+        if values.empty or values.str.fullmatch(r"-?\d+([.,]\d+)?").mean() >= min_share:
             continue
-        sample = values.head(200)
-        for pattern, fmt in _DATE_FORMATS:
-            if sample.str.match(pattern).mean() < min_share:
-                continue
-            if fmt == "mixed":
-                parsed = pd.to_datetime(series, errors="coerce", dayfirst=True, format="mixed")
-            else:
-                parsed = pd.to_datetime(series, errors="coerce", format=fmt)
-            if parsed.notna().sum() >= min_share * len(values):
-                df[column] = parsed
-            break
+        uniques = list(dict.fromkeys(values.tolist()))
+        parser = infer_date_parser(uniques, min_share=min_share)
+        if parser is None:
+            continue
+        mapping = {v: parser.parse(v) for v in uniques}
+        if sum(1 for v in values if mapping.get(v) is not None) < min_share * len(values):
+            continue
+        parsed = series.map(lambda v: mapping.get(str(v).strip()) if isinstance(v, str) else None)
+        df[column] = pd.to_datetime(parsed, errors="coerce") if parser.kind == "datetime" else parsed.astype(object)
     return df
 
 
@@ -114,6 +108,8 @@ def _profile_frame(df: pd.DataFrame, original_headers: list[str]) -> list[dict]:
         elif pd.api.types.is_float_dtype(series):
             logical_type = "float"
         elif pd.api.types.is_datetime64_any_dtype(series):
+            logical_type = "datetime"
+        elif series.dropna().map(lambda v: isinstance(v, date)).all() and series.notna().any():
             logical_type = "date"
         else:
             logical_type = "str"

@@ -27,9 +27,9 @@ _PG_TO_DSL = {
     "boolean": "bool",
     "bool": "bool",
     "date": "date",
-    "timestamp without time zone": "date",
-    "timestamp with time zone": "date",
-    "timestamptz": "date",
+    "timestamp without time zone": "datetime",
+    "timestamp with time zone": "datetime",
+    "timestamptz": "datetime",
 }
 _ID_NAME_RE = re.compile(r"(^|\W|_)(код|id|идентификатор|номер|артикул)(\W|_|$)", re.I)
 _TOP_VALUES = 10
@@ -46,6 +46,8 @@ def _q(name: str) -> str:
 def _semantic(name: str, kind: str, distinct: int, non_null: int) -> SemanticType:
     if kind == "date":
         return SemanticType.DATE
+    if kind == "datetime":
+        return SemanticType.DATETIME
     if kind == "bool":
         return SemanticType.BOOLEAN
     if _ID_NAME_RE.search(name) and kind in ("int", "str"):
@@ -127,7 +129,7 @@ class PostgresCatalogProvider:
             
             derived = []
             for c in columns:
-                if c.semantic_type is SemanticType.DATE:
+                if c.semantic_type in (SemanticType.DATE, SemanticType.DATETIME):
                     derived.append(ColumnInfo(
                         name=f"{c.name} (месяц)",
                         db_type="date",
@@ -146,7 +148,7 @@ class PostgresCatalogProvider:
                     ))
             columns.extend(derived)
             
-            time_col = next((c for c in columns if c.semantic_type is SemanticType.DATE), None)
+            time_col = next((c for c in columns if c.semantic_type in (SemanticType.DATE, SemanticType.DATETIME)), None)
             tables.append(
                 TableInfo(
                     name=tname,
@@ -184,7 +186,7 @@ class PostgresCatalogProvider:
             null_share=round(1 - (non_null or 0) / total, 4) if total else None,
             distinct_count=int(distinct or 0),
         )
-        if kind in ("int", "float", "date") and semantic is not SemanticType.ID and cmin is not None:
+        if kind in ("int", "float", "date", "datetime") and semantic is not SemanticType.ID and cmin is not None:
             info.min_value, info.max_value = _fmt(cmin), _fmt(cmax)
         if kind in ("int", "float") and semantic is not SemanticType.ID:
             try:

@@ -14,7 +14,7 @@ from ..contracts.tools import ToolContext, ToolStatus
 from .dsl_to_sql import DslCompileError, compile_dsl_to_sql
 from .query_dsl import QueryArgs, SourceArg, format_errors
 
-DSL_TYPES = frozenset({"int", "float", "str", "date", "bool"})
+DSL_TYPES = frozenset({"int", "float", "str", "date", "datetime", "bool"})
 MIXED_SOURCES_TEXT = "Нельзя в одном запросе соединять таблицы, загруженные в память, и таблицы из базы данных."
 DB_UNAVAILABLE_TEXT = "Таблицы из базы данных сейчас недоступны."
 
@@ -25,6 +25,8 @@ AGG_OUTPUT_TYPES: dict[str, str | None] = {
     "sum": None,
     "min": None,
     "max": None,
+    "median": "float",
+    "percentile": "float",
 }
 
 
@@ -47,7 +49,9 @@ def catalog_schema(catalog: Catalog) -> dict[str, dict[str, str]]:
 
 
 def _normalize(value: Any, kind: str | None) -> Any:
-    if isinstance(value, datetime) and value.time() == time() and value.tzinfo is None:
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        value = value.replace(tzinfo=None)
+    if isinstance(value, datetime) and kind != "datetime" and value.time() == time():
         return value.date()
     if isinstance(value, Decimal):
         return int(value) if kind == "int" and value == value.to_integral_value() else float(value)

@@ -3,17 +3,29 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from app.query_system.expressions import (
+    UNIT_SECONDS,
+    Bin,
+    Call,
+    Col,
+    ExpressionError,
+    IsNull,
+    Lit,
+    Node,
+    Un,
+    parse_expression,
+    unit_of,
+)
+
 from .query_dsl import (
     AggregateStepArg,
-    AndCondition,
     Condition,
+    DeriveArg,
     DistinctArg,
     FilterArg,
     JoinArg,
     Leaf,
     LimitArg,
-    NotCondition,
-    OrCondition,
     QueryArgs,
     SelectArg,
     SortArg,
@@ -40,7 +52,7 @@ def _q(name: str) -> str:
 def _col(name: str, alias: str = "") -> str:
     prefix = f"{alias}." if alias else ""
     if name.endswith(" (месяц)"):
-        return f"date_trunc('month', {prefix}{_q(name[:-8])})"
+        return f"date_trunc('month', {prefix}{_q(name[:-8])})::date"
     if name.endswith(" (год)"):
         return f"EXTRACT(YEAR FROM {prefix}{_q(name[:-6])})::int"
     return f"{prefix}{_q(name)}"
@@ -77,11 +89,11 @@ def _cond(c: Condition) -> str:
         if c.cmp == "is_not_null":
             return f"{col} IS NOT NULL"
         raise DslCompileError(f"неизвестное сравнение {c.cmp}")
-    if isinstance(c, AndCondition):
+    if hasattr(c, "all_of"):
         return "(" + " AND ".join(_cond(x) for x in c.all_of) + ")"
-    if isinstance(c, OrCondition):
+    if hasattr(c, "any_of"):
         return "(" + " OR ".join(_cond(x) for x in c.any_of) + ")"
-    if isinstance(c, NotCondition):
+    if hasattr(c, "negated"):
         return "NOT (" + _cond(c.negated) + ")"
     raise DslCompileError(f"неизвестное условие {type(c).__name__}")
 
@@ -93,11 +105,87 @@ def _agg(a: Any) -> str:
         return f"COUNT(DISTINCT {_col(a.column)}) AS {_q(a.alias)}"
     if a.column == "*":
         return f"COUNT(*) AS {_q(a.alias)}"
+    if a.func in ("median", "percentile"):
+        p = 0.5 if a.func == "median" or a.p is None else a.p / 100 if a.p > 1 else a.p
+        return f"percentile_cont({float(p)!r}) WITHIN GROUP (ORDER BY {_col(a.column)}) AS {_q(a.alias)}"
     return f"{a.func.upper()}({_col(a.column)}) AS {_q(a.alias)}"
 
 
 def _order_by(order: list[tuple[str, str]]) -> str:
-    return " ORDER BY " + ", ".join(f"{_col(c)} {d.upper()}" for c, d in order) if order else ""
+    return " ORDER BY " + ", ".join(f"{_col(c)} {d.upper()} NULLS LAST" for c, d in order) if order else ""
+
+
+def _ts(sql: str) -> str:
+    return f"CAST({sql} AS timestamp)"
+
+
+def _expr(node: Node, derived: dict[str, str]) -> str:
+    if isinstance(node, Lit):
+        return _lit(node.value)
+    if isinstance(node, Col):
+        return derived.get(node.name) or _col(node.name)
+    if isinstance(node, IsNull):
+        return f"({_expr(node.arg, derived)} IS {'NOT ' if node.negated else ''}NULL)"
+    if isinstance(node, Un):
+        return f"(NOT {_expr(node.arg, derived)})" if node.op == "not" else f"(-{_expr(node.arg, derived)})"
+    if isinstance(node, Bin):
+        left, right = _expr(node.left, derived), _expr(node.right, derived)
+        if node.op == "/":
+            return f"(CAST({left} AS double precision) / NULLIF({right}, 0))"
+        op = {"and": "AND", "or": "OR", "!=": "<>"}.get(node.op, node.op)
+        return f"({left} {op} {right})"
+    if isinstance(node, Call):
+        return _call(node, derived)
+    raise DslCompileError("неизвестный элемент выражения")
+
+
+def _call(node: Call, derived: dict[str, str]) -> str:
+    fn = node.fn
+    if fn == "date_diff":
+        unit = unit_of(node.args[0])
+        start, end = (_ts(_expr(a, derived)) for a in node.args[1:])
+        return f"(EXTRACT(EPOCH FROM ({end} - {start})) / {float(UNIT_SECONDS[unit])!r})"
+    if fn == "date_trunc":
+        unit = unit_of(node.args[0])
+        body = f"date_trunc('{unit}', {_ts(_expr(node.args[1], derived))})"
+        return body if unit in ("minute", "hour") else f"CAST({body} AS date)"
+    args = [_expr(a, derived) for a in node.args]
+    first = args[0]
+    simple = {"greatest": "GREATEST", "least": "LEAST", "coalesce": "COALESCE", "nullif": "NULLIF", "abs": "ABS"}
+    if fn in simple:
+        return f"{simple[fn]}({', '.join(args)})"
+    if fn == "if":
+        return f"(CASE WHEN {args[0]} THEN {args[1]} ELSE {args[2]} END)"
+    if fn == "round":
+        digits = args[1] if len(args) > 1 else "0"
+        return f"CAST(ROUND(CAST({first} AS numeric), {digits}) AS double precision)"
+    if fn == "isnull":
+        return f"({first} IS NULL)"
+    if fn == "notnull":
+        return f"({first} IS NOT NULL)"
+    if fn == "days_in_month":
+        return f"CAST(EXTRACT(DAY FROM (date_trunc('month', {_ts(first)}) + interval '1 month' - interval '1 day')) AS int)"
+    if fn == "month":
+        return f"CAST(date_trunc('month', {_ts(first)}) AS date)"
+    if fn == "date":
+        return f"CAST({_ts(first)} AS date)"
+    parts = {"year": "YEAR", "day": "DAY", "hour": "HOUR", "weekday": "ISODOW"}
+    if fn in parts:
+        return f"CAST(EXTRACT({parts[fn]} FROM {_ts(first)}) AS int)"
+    raise DslCompileError(f"функция {fn} не поддерживается")
+
+
+def _derive(step: DeriveArg) -> list[str]:
+    derived: dict[str, str] = {}
+    parts: list[str] = []
+    for col in step.columns:
+        try:
+            sql = _expr(parse_expression(col.expr), derived)
+        except ExpressionError as e:
+            raise DslCompileError(f"формула «{col.expr}»: {e}") from e
+        derived[col.name] = sql
+        parts.append(f"{sql} AS {_q(col.name)}")
+    return parts
 
 
 def compile_dsl_to_sql(
@@ -133,6 +221,10 @@ def compile_dsl_to_sql(
             src = rel(step.input)
             body = f"SELECT * FROM {_q(step.input)} WHERE {_cond(step.condition)}{_order_by(src.order)}"
             out = _Rel(src.columns, src.order)
+        elif isinstance(step, DeriveArg):
+            src = rel(step.input)
+            body = f"SELECT *, {', '.join(_derive(step))} FROM {_q(step.input)}{_order_by(src.order)}"
+            out = _Rel([*src.columns, *(c.name for c in step.columns)], src.order)
         elif isinstance(step, SortArg):
             src = rel(step.input)
             order = [(k.column, k.dir) for k in step.by]

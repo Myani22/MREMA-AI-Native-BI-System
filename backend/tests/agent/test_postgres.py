@@ -68,7 +68,9 @@ def test_catalog_keeps_russian_headers_and_dates(db):
     catalog = PostgresCatalogProvider(engine).catalog()
     info = catalog.table(table)
     assert info.display_name == "Товары"
-    assert [c.name for c in info.columns] == ["товар", "price", "cost", "дата_поступления"]
+    assert [c.name for c in info.columns] == [
+        "товар", "price", "cost", "дата_поступления", "дата_поступления (месяц)", "дата_поступления (год)",
+    ]
     assert info.column("товар").display_name == "Товар"
     assert info.column("дата_поступления").db_type == "date"
     assert info.period_start.startswith("2024-01-05")
@@ -102,7 +104,7 @@ def test_data_query_runs_on_postgres_with_qualified_columns(db):
     args = QueryArgs.model_validate(tool.preprocess_args(raw, catalog))
     result = asyncio.run(tool.run(args, _ctx(engine, catalog)))
     assert result.status is ToolStatus.OK, result.error
-    assert result.table.rows == [["2024-02", 150.0], ["2024-01", 100.5]]
+    assert result.table.rows == [["2024-02-01", 150.0], ["2024-01-01", 100.5]]
     assert "WITH" in result.sql
 
 
@@ -190,7 +192,7 @@ def test_memory_and_database_tables_live_together(db, tmp_path):
             {"steps": [
                 {"var": "T", "op": "source", "table": table},
                 {"var": "F", "op": "filter", "input": "T",
-                 "condition": {"column": "month", "cmp": "eq", "value": "2024-02"}},
+                 "condition": {"column": "month", "cmp": "eq", "value": "2024-02-01"}},
                 {"var": "A", "op": "aggregate", "input": "F", "group_by": [],
                  "aggregates": [{"func": "sum", "column": "revenue", "alias": "Выручка"}]},
             ], "output": "A"},

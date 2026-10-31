@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -119,6 +120,30 @@ def _fix_condition_columns(cond: Any, fixer: Callable[[Any], Any]) -> Any:
     return cond
 
 
+_EXPR_SEGMENTS = re.compile(r"(\[[^\]]*\]|'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\")")
+_SIMPLE_NAME = re.compile(r"^[^\W\d]\w*$")
+
+
+def _fix_expression(expr: Any, known: list[str], fixer: Callable[[Any], Any]) -> Any:
+    if not isinstance(expr, str):
+        return expr
+    complex_names = sorted((n for n in known if not _SIMPLE_NAME.match(n)), key=len, reverse=True)
+    pattern = (
+        re.compile("|".join(rf"(?<![\w\[]){re.escape(n)}(?![\w\]])" for n in complex_names)) if complex_names else None
+    )
+    parts: list[str] = []
+    for segment in _EXPR_SEGMENTS.split(expr):
+        if segment.startswith("[") and segment.endswith("]"):
+            parts.append(f"[{fixer(segment[1:-1].strip())}]")
+        elif len(segment) > 1 and segment.startswith('"') and segment.endswith('"'):
+            parts.append(f"[{fixer(segment[1:-1].replace(chr(34) * 2, chr(34)))}]")
+        elif segment.startswith("'") or pattern is None:
+            parts.append(segment)
+        else:
+            parts.append(pattern.sub(lambda m: f"[{m.group(0)}]", segment))
+    return "".join(parts)
+
+
 def _table_aliases(catalog: Catalog) -> dict[str, str]:
     aliases: dict[str, str] = {}
     for t in catalog.tables:
@@ -150,6 +175,13 @@ def fix_query_args_columns(data: Any, catalog: Catalog) -> Any:
     known += [
         a["alias"] for s in steps for a in s.get("aggregates") or [] if isinstance(a, dict) and isinstance(a.get("alias"), str)
     ]
+    known += [
+        c["name"]
+        for s in steps
+        if s.get("op") == "derive"
+        for c in s.get("columns") or []
+        if isinstance(c, dict) and isinstance(c.get("name"), str)
+    ]
     known_set = set(known)
     prefixes = sorted({p for t in scope for p in (t.name, t.display_name) if p}, key=len, reverse=True)
 
@@ -175,8 +207,12 @@ def fix_query_args_columns(data: Any, catalog: Catalog) -> Any:
         s = dict(step)
         if s.get("op") == "source" and "table" in s:
             s["table"] = fix_table(s["table"])
+        if s.get("op") == "derive" and isinstance(s.get("columns"), list):
+            s["columns"] = [
+                {**c, "expr": _fix_expression(c.get("expr"), known, fix)} if isinstance(c, dict) else c for c in s["columns"]
+            ]
         for key in ("group_by", "columns"):
-            if isinstance(s.get(key), list):
+            if s.get("op") != "derive" and isinstance(s.get(key), list):
                 s[key] = [fix(c) for c in s[key]]
         for key in ("aggregates", "by"):
             if isinstance(s.get(key), list):

@@ -7,54 +7,45 @@ import re
 import statistics
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Any
+
+from app.query_system.dates import DateParser, infer_date_parser
 
 from ..contracts.catalog import Catalog, ColumnInfo, Relation, SemanticType, TableInfo, ValueCount
 
 _INT_RE = re.compile(r"^-?\d+$")
 _FLOAT_RE = re.compile(r"^-?\d{1,3}(?:[  ]\d{3})*(?:[.,]\d+)?$|^-?\d+(?:[.,]\d+)?$")
-_DATE_FORMATS = ("%Y-%m-%d", "%d.%m.%Y", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M")
 _BOOL_VALUES = {"true": True, "false": False, "да": True, "нет": False}
 _ID_NAME_RE = re.compile(r"(^|\W)(код|id|идентификатор|номер|артикул)(\W|$)", re.I)
 _NULLS = {"", "null", "none", "nan", "n/a", "-"}
 _SAMPLE = 2000
 
 
-def _parse_date(value: str) -> tuple[date, bool] | None:
-    for fmt in _DATE_FORMATS:
-        try:
-            parsed = datetime.strptime(value, fmt)
-        except ValueError:
-            continue
-        return parsed.date(), ("%H" in fmt)
-    return None
-
-
 def _to_float(value: str) -> float:
     return float(value.replace(" ", "").replace(" ", "").replace(",", "."))
 
 
-def infer_type(values: list[str]) -> tuple[str, bool]:
+def infer_type(values: list[str]) -> tuple[str, DateParser | None]:
     sample = values[:_SAMPLE]
     if not sample:
-        return "str", False
+        return "str", None
     if all(v.lower() in _BOOL_VALUES for v in sample):
-        return "bool", False
+        return "bool", None
     if all(_INT_RE.match(v) for v in sample):
         if any(len(v.lstrip("-")) > 1 and v.lstrip("-").startswith("0") for v in sample):
-            return "str", False
-        return "int", False
+            return "str", None
+        return "int", None
     if all(_FLOAT_RE.match(v) for v in sample):
-        return "float", False
-    dates = [_parse_date(v) for v in sample]
-    if all(dates):
-        return "date", any(d[1] for d in dates if d)
-    return "str", False
+        return "float", None
+    parser = infer_date_parser(sample, min_share=0.95)
+    if parser is not None:
+        return parser.kind, parser
+    return "str", None
 
 
-def _convert(value: str, kind: str) -> Any:
+def _convert(value: str, kind: str, parser: DateParser | None = None) -> Any:
     if value.strip().lower() in _NULLS:
         return None
     v = value.strip()
@@ -66,9 +57,8 @@ def _convert(value: str, kind: str) -> Any:
                 return _to_float(v)
             case "bool":
                 return _BOOL_VALUES.get(v.lower())
-            case "date":
-                parsed = _parse_date(v)
-                return parsed[0] if parsed else None
+            case "date" | "datetime":
+                return parser.parse(v) if parser else None
     except ValueError:
         return None
     return v
@@ -139,16 +129,17 @@ def parse_csv(raw: bytes, filename: str) -> LoadedTable:
 
     schema: dict[str, str] = {}
     with_time: set[str] = set()
+    parsers: dict[str, DateParser | None] = {}
     for i, col in enumerate(columns):
         values = [r[i].strip() for r in raw_rows if r[i].strip().lower() not in _NULLS]
-        kind, has_time = infer_type(values)
+        kind, parsers[col] = infer_type(values)
         schema[col] = kind
-        if has_time:
+        if kind == "datetime":
             with_time.add(col)
 
-    rows = [{col: _convert(r[i], schema[col]) for i, col in enumerate(columns)} for r in raw_rows]
+    rows = [{col: _convert(r[i], schema[col], parsers[col]) for i, col in enumerate(columns)} for r in raw_rows]
     derived: dict[str, str] = {}
-    for col in [c for c, k in schema.items() if k == "date"]:
+    for col in [c for c, k in schema.items() if k in ("date", "datetime")]:
         month_col, year_col = f"{col} (месяц)", f"{col} (год)"
         if month_col in schema or year_col in schema:
             continue
@@ -162,7 +153,7 @@ def parse_csv(raw: bytes, filename: str) -> LoadedTable:
 
 
 def _semantic(name: str, kind: str, distinct: int, non_null: int, has_time: bool) -> SemanticType:
-    if kind == "date":
+    if kind in ("date", "datetime"):
         return SemanticType.DATETIME if has_time else SemanticType.DATE
     if kind == "bool":
         return SemanticType.BOOLEAN
@@ -251,7 +242,7 @@ class InMemoryCsvStore:
                 sample_values=[_fmt(v) for v in list(dict.fromkeys(values))[:5]],
                 description=f"производная от «{t.derived[col]}»" if col in t.derived else None,
             )
-            if kind in ("int", "float", "date") and values and semantic is not SemanticType.ID:
+            if kind in ("int", "float", "date", "datetime") and values and semantic is not SemanticType.ID:
                 info.min_value, info.max_value = _fmt(min(values)), _fmt(max(values))
             if kind in ("int", "float") and values and semantic is not SemanticType.ID:
                 try:
@@ -273,8 +264,8 @@ class InMemoryCsvStore:
             columns=columns,
             primary_key=next((c.name for c in columns if c.semantic_type is SemanticType.ID and c.distinct_count == total), None),
             time_column=time_col.name if time_col else None,
-            period_start=time_col.min_value if time_col else None,
-            period_end=time_col.max_value if time_col else None,
+            period_start=time_col.min_value[:10] if time_col and time_col.min_value else None,
+            period_end=time_col.max_value[:10] if time_col and time_col.max_value else None,
         )
 
     def _relations(self, tables: list[TableInfo]) -> list[Relation]:

@@ -71,8 +71,8 @@ def test_sql_compiler_keeps_order_through_limit_and_wraps_having():
     })
     sql = compile_dsl_to_sql(args, columns={"dataset_a1": ["month", "revenue"]})
     assert 'SELECT * FROM (SELECT "month", SUM("revenue") AS "Выручка" FROM "T" GROUP BY "month") AS _g WHERE "Выручка" > 10' in sql
-    assert '"L" AS (SELECT * FROM "S" ORDER BY "Выручка" DESC LIMIT 2)' in sql
-    assert sql.endswith('SELECT * FROM "L" ORDER BY "Выручка" DESC')
+    assert '"L" AS (SELECT * FROM "S" ORDER BY "Выручка" DESC NULLS LAST LIMIT 2)' in sql
+    assert sql.endswith('SELECT * FROM "L" ORDER BY "Выручка" DESC NULLS LAST')
 
 
 def test_sql_compiler_suffixes_join_collisions():

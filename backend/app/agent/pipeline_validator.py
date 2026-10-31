@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .integrations.query_dsl import (
     AggregateStepArg,
+    DeriveArg,
     FilterArg,
     JoinArg,
     LimitArg,
@@ -11,17 +12,19 @@ from .integrations.query_dsl import (
     StepArg,
 )
 
-ALLOWED_OPS = {"source", "filter", "join", "aggregate", "sort", "limit"}
+ALLOWED_OPS = {"source", "filter", "derive", "join", "aggregate", "sort", "limit"}
 FORBIDDEN_OPS = {"select", "distinct"}
 
 _STAGE_ORDER = {
     "source": 0,
     "join": 1,
     "filter": 2,
-    "aggregate": 3,
-    "sort": 4,
-    "limit": 5,
+    "derive": 2,
+    "aggregate": 2,
+    "sort": 3,
+    "limit": 4,
 }
+_MAX_COUNT = {"source": 2, "join": 1, "filter": 3, "derive": 4, "aggregate": 3, "sort": 1, "limit": 1}
 
 
 def _step_op(step: StepArg) -> str:
@@ -46,6 +49,7 @@ def validate_chart_pipeline(args: QueryArgs, *, chart_type: str) -> list[str]:
     current_stage = 0
     source_vars: set[str] = set()
     agg_step: AggregateStepArg | None = None
+    after_agg: set[str] = set()
 
     for i, step in enumerate(steps):
         op = _step_op(step)
@@ -56,17 +60,17 @@ def validate_chart_pipeline(args: QueryArgs, *, chart_type: str) -> list[str]:
             continue
 
         stage = _STAGE_ORDER[op]
-        if stage < current_stage:
+        if stage < current_stage or (isinstance(step, FilterArg) and agg_step is not None):
+            hint = " Для отбора групп после aggregate используй having." if isinstance(step, FilterArg) else ""
             errors.append(
-                f"шаг {i}: нарушен порядок шагов ({op} не может идти после более поздней стадии)"
+                f"шаг {i}: нарушен порядок шагов ({op} не может идти после более поздней стадии).{hint}"
             )
         current_stage = max(current_stage, stage)
 
         op_counts[op] += 1
-        max_allowed = 2 if op == "source" else 1
-        if op_counts[op] > max_allowed:
+        if op_counts[op] > _MAX_COUNT[op]:
             errors.append(
-                f"шаг {i}: больше одного {op} не разрешено (join требует ровно 2 source)"
+                f"шаг {i}: слишком много шагов {op} (максимум {_MAX_COUNT[op]}; join требует ровно 2 source)"
             )
 
         if isinstance(step, SourceArg):
@@ -84,6 +88,9 @@ def validate_chart_pipeline(args: QueryArgs, *, chart_type: str) -> list[str]:
                 )
         elif isinstance(step, AggregateStepArg):
             agg_step = step
+            after_agg = set()
+        elif isinstance(step, DeriveArg) and agg_step is not None:
+            after_agg |= {c.name for c in step.columns}
 
     if op_counts["join"] == 0 and op_counts["source"] > 1:
         errors.append("без join разрешён только один шаг source")
@@ -94,13 +101,13 @@ def validate_chart_pipeline(args: QueryArgs, *, chart_type: str) -> list[str]:
         errors.append("sort требует aggregate перед ним (или уберите sort)")
 
     if op_counts["sort"] > 0 and agg_step is not None:
-        allowed_sort_cols = {*agg_step.group_by, *(a.alias for a in agg_step.aggregates)}
+        allowed_sort_cols = {*agg_step.group_by, *(a.alias for a in agg_step.aggregates), *after_agg}
         for step in steps:
             if isinstance(step, SortArg):
                 for key in step.by:
                     if key.column not in allowed_sort_cols:
                         errors.append(
-                            f"sort по колонке «{key.column}» запрещён: допустимы только выходы aggregate {sorted(allowed_sort_cols)}"
+                            f"sort по колонке «{key.column}» запрещён: допустимы только выходы последнего aggregate и derive после него {sorted(allowed_sort_cols)}"
                         )
 
     if op_counts["limit"] > 0:

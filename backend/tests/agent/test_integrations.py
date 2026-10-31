@@ -1,5 +1,5 @@
 import asyncio
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 
@@ -45,7 +45,8 @@ def test_csv_types_russian_headers_and_derived_periods():
     t = parse_csv(SALES, "Продажи.csv")
     assert t.schema["Количество, шт."] == "int"
     assert t.schema["Цена, руб."] == "float" and t.rows[0]["Цена, руб."] == 298.70
-    assert t.schema["Дата операции (МСК)"] == "date" and t.rows[0]["Дата операции (МСК)"] == date(2024, 10, 1)
+    assert t.schema["Дата операции (МСК)"] == "datetime"
+    assert t.rows[0]["Дата операции (МСК)"] == datetime(2024, 10, 1, 2, 27, 58)
     assert t.schema["Код магазина"] == "str" and t.rows[0]["Код магазина"] == "007"
     assert t.rows[4]["Код магазина"] is None
     assert t.rows[2]["Дата операции (МСК) (месяц)"] == date(2024, 11, 1)
