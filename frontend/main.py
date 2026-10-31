@@ -149,7 +149,7 @@ with st.sidebar:
                             payload = {"url": DB_URL, "schema": current_schema}
                             
                             try:
-                                sync_resp = requests.post(f"{API_URL}/datasets/import-db", json=payload, timeout=30)
+                                sync_resp = requests.post(f"{API_URL}/datasets/import-db", json=payload, timeout=120)
                                 if sync_resp.status_code == 200:
                                     sync_data = sync_resp.json()
                                     st.success(f"БД обновлена! Всего таблиц: {sync_data.get('tables', 0)}")
