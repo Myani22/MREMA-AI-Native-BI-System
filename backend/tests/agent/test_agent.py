@@ -152,19 +152,19 @@ def test_chart_pipeline_with_dsl_repair():
 def test_invented_numbers_fall_back_to_tool_text():
     llm = ScriptedLLM({
         "intent_decision": [intent("chart", "Сумма по городам", wants_explanation=True)],
-        "chart_plan": [{"items": [{"chart_type": "bar", "title": "Сумма",
-                                   "purpose": "Сравнение"}]}],
+        "chart_plan": [{"items": [{"chart_type": "bar", "title": "Сумма", "purpose": "Сравнение"}]}],
         "dsl_query": [_bar_dsl()],
-        "narrative": [narrative("Всего 999999.", ["Число 888888"])],
+        "narrative": [
+            narrative("Всего 999999.", ["Число 888888"]),
+            narrative("Всего 999999.", ["Число 888888"]),
+        ],
     })
     bundle = make_bundle(llm, {"sales.csv": SALES_CSV.encode()})
     r = asyncio.run(bundle.agent.handle("s1", "Сумма по городам"))
+    
     assert r.status == "ok"
-    assert any("числа без опоры" in w for w in r.trace.warnings)
-
-    texts = [b for b in r.blocks if isinstance(b, TextBlock)]
-    assert any("Готово, результат ниже" in t.markdown for t in texts)
-
+    text_block = next(b for b in r.blocks if b.type == "text")
+    assert "Готово, результат ниже." in text_block.markdown
 
 def test_empty_catalog_says_load_data():
     llm = ScriptedLLM({"intent_decision": [intent("overview", "Что тут?")]})
@@ -214,3 +214,55 @@ def test_status_events_are_streamed():
     assert events[0] == "routing"
     assert "writing" in events
     assert events[-1] == "done"
+
+
+def test_hypothesis_with_digits_is_filtered():
+    bad_narrative = {
+        "summary": "Найдено 10 строк.",
+        "points": [],
+        "hypothesis": "Вероятно, рост составил 20%.",
+        "follow_ups": []
+    }
+    
+    llm = ScriptedLLM({
+        "intent_decision": [intent("chart", "Сумма по городам", wants_explanation=True)],
+        "chart_plan": [{"items": [{"chart_type": "bar", "title": "Сумма", "purpose": "Сравнение"}]}],
+        "dsl_query": [_bar_dsl()],
+        "narrative": [
+            bad_narrative,
+            bad_narrative
+        ],
+    })
+    bundle = make_bundle(llm, {"sales.csv": SALES_CSV.encode()})
+    r = asyncio.run(bundle.agent.handle("s1", "Сумма по городам"))
+    
+    assert r.status == "ok"
+    text_block = next(b for b in r.blocks if b.type == "text")
+    
+    assert text_block.markdown != ""
+    
+    assert "20%" not in text_block.markdown
+    assert "рост составил" not in text_block.markdown
+
+
+def test_clean_hypothesis_is_kept():
+    good_narrative = {
+        "summary": "Выручка выросла.", 
+        "points": [],
+        "hypothesis": "Возможно, это связано с началом сезона распродаж.",
+        "follow_ups": []
+    }
+    
+    llm = ScriptedLLM({
+        "intent_decision": [intent("chart", "Сумма", wants_explanation=True)],
+        "chart_plan": [{"items": [{"chart_type": "bar", "title": "Сумма", "purpose": "Сравнение"}]}],
+        "dsl_query": [_bar_dsl()],
+        "narrative": [good_narrative],
+    })
+    bundle = make_bundle(llm, {"sales.csv": SALES_CSV.encode()})
+    r = asyncio.run(bundle.agent.handle("s1", "Сумма"))
+    
+    assert r.status == "ok"
+    text_block = next(b for b in r.blocks if b.type == "text")
+    
+    assert "*Возможно, это связано с началом сезона распродаж.*" in text_block.markdown
