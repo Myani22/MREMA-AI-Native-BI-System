@@ -19,14 +19,13 @@ class IntentDecision(BaseModel):
     standalone_question: str = Field(description="Самостоятельная формулировка вопроса с учётом диалога")
     intent: Intent
     wants_explanation: bool = Field(
-        default=False,
-        description="True, если пользователь явно просит объяснить, проанализировать или рассказать почему",
+        default=True,
+        description="True по умолчанию. Установи в False ТОЛЬКО если пользователь явно просит НЕ объяснять, вывести ТОЛЬКО график/таблицу или просит ответ без текста."
     )
     chart_type: ChartType | None = None
     point_number: int | None = Field(None, ge=1)
     target_microsession_id: str | None = None
     clarification_question: str | None = None
-
 
 _CHART_WORDS: list[tuple[re.Pattern[str], ChartType]] = [
     (re.compile(r"кругов|пирог|пончик", re.I), ChartType.PIE),
