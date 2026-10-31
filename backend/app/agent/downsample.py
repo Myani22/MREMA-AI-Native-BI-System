@@ -8,13 +8,16 @@ from typing import Any
 from .contracts.catalog import SemanticType
 from .contracts.response import ChartSpec, ChartType, ResultTable
 
-MAX_LINE_POINTS = 1000
+MAX_LINE_POINTS = 300
 MAX_SCATTER_POINTS = 3000
 MAX_BAR_CATEGORIES = 100
 MAX_TABLE_ROWS = 500
 
+SMOOTHING_WINDOW_PERCENT = 0.1
+
 
 def _safe_sort_key(row: list[Any], idx: int) -> tuple[int, Any]:
+    """Безопасный ключ сортировки (NULL всегда в конце)."""
     val = row[idx]
     if val is None:
         return (1, "")
@@ -26,6 +29,7 @@ def _safe_sort_key(row: list[Any], idx: int) -> tuple[int, Any]:
 
 
 def _average_datetime(dates: list[Any]) -> datetime | date | None:
+    """Вычисляет среднее время для окна дат."""
     valid_dates = [d for d in dates if d is not None]
     if not valid_dates:
         return None
@@ -56,6 +60,7 @@ def _average_datetime(dates: list[Any]) -> datetime | date | None:
 
 
 def _aggregate_bucket(bucket: list[list[Any]], table: ResultTable) -> list[Any]:
+    """Агрегирует окно строк в одну усреднённую точку (скользящее среднее)."""
     if not bucket:
         return []
     
@@ -67,21 +72,30 @@ def _aggregate_bucket(bucket: list[list[Any]], table: ResultTable) -> list[Any]:
             continue
             
         if col.semantic_type == SemanticType.NUMERIC:
+            # Для чисел — математическое среднее
             try:
                 agg_row.append(sum(vals) / len(vals))
             except TypeError:
                 agg_row.append(Counter(vals).most_common(1)[0][0])
                 
         elif col.semantic_type in (SemanticType.DATETIME, SemanticType.DATE):
+            # Для дат — вычисляем среднюю точку во времени
             agg_row.append(_average_datetime(vals))
             
         else:
+            # Для текста, ID, категорий — берём самое частое значение (моду)
             agg_row.append(Counter(vals).most_common(1)[0][0])
             
     return agg_row
 
 
 def downsample_for_chart(table: ResultTable, spec: ChartSpec) -> tuple[ResultTable, ChartSpec, bool]:
+    """
+    Умное прореживание данных: 
+    - Скользящее среднее (окно вокруг точки) для линий.
+    - Случайная выборка для scatter.
+    - Срезы для таблиц и столбцов.
+    """
     rows = table.rows
     total = len(rows)
     if total == 0:
@@ -93,6 +107,7 @@ def downsample_for_chart(table: ResultTable, spec: ChartSpec) -> tuple[ResultTab
 
     if chart_type in (ChartType.LINE, ChartType.AREA):
         if total > MAX_LINE_POINTS:
+            # Сортируем данные по оси X
             if spec.x:
                 try:
                     idx = [c.name for c in table.columns].index(spec.x)
@@ -102,14 +117,25 @@ def downsample_for_chart(table: ResultTable, spec: ChartSpec) -> tuple[ResultTab
             else:
                 sorted_rows = rows
             
-            bucket_size = total / MAX_LINE_POINTS
+            # Считаем размер окна в абсолютных строках
+            window_size = max(1, int(total * SMOOTHING_WINDOW_PERCENT))
+            half_window = window_size // 2
+            
+            # Шаг, с которым мы расставляем целевые точки
+            step = total / MAX_LINE_POINTS
             sampled_rows = []
+            
             for i in range(MAX_LINE_POINTS):
-                start_idx = int(i * bucket_size)
-                end_idx = int((i + 1) * bucket_size)
-                bucket = sorted_rows[start_idx:end_idx]
-                if bucket:
-                    sampled_rows.append(_aggregate_bucket(bucket, table))
+                # Индекс центральной точки в оригинальном массиве
+                center_idx = int(i * step)
+                
+                # Границы окна (с защитой от выхода за пределы массива)
+                start_idx = max(0, center_idx - half_window)
+                end_idx = min(total, center_idx + half_window + 1)
+                
+                window_slice = sorted_rows[start_idx:end_idx]
+                if window_slice:
+                    sampled_rows.append(_aggregate_bucket(window_slice, table))
                     
             is_sampled = True
 
@@ -138,7 +164,7 @@ def downsample_for_chart(table: ResultTable, spec: ChartSpec) -> tuple[ResultTab
     })
     
     if chart_type in (ChartType.LINE, ChartType.AREA):
-        suffix = " (усреднение)"
+        suffix = " (сглаживание)"
     elif chart_type == ChartType.SCATTER:
         suffix = " (выборка)"
     else:

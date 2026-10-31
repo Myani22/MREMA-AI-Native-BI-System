@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
+from datetime import datetime
+
 
 import matplotlib.pyplot as plt
 
@@ -152,10 +154,17 @@ class LineChart(ChartBase):
         if not rows:
             return render_empty_figure(self.title)
 
-        x_values = [
-            str(r[self.x.name]) if not isinstance(r[self.x.name], (int, float)) else r[self.x.name]
-            for r in rows
-        ]
+
+        x_values = []
+        for r in rows:
+            val = r[self.x.name]
+            if isinstance(val, str) and len(val) >= 10 and val[4] == '-':
+                try:
+                    val = datetime.fromisoformat(val.replace('Z', '+00:00'))
+                except ValueError:
+                    pass
+            x_values.append(val)
+            
         y_values = [float(r[self.y.name]) for r in rows]
 
         fig, ax = plt.subplots(figsize=FIGURE_SIZE, dpi=FIGURE_DPI)
