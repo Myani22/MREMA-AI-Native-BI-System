@@ -15,6 +15,7 @@ from .llm.client import ChatMessage, LLMClient, system_msg, user_msg
 from .llm.errors import StructuredOutputError
 from .llm.structured import generate_structured
 from .pipeline_validator import validate_chart_pipeline
+from .pattern_hints import build_pattern_hints, detect_patterns
 from .prompts import DSL_EXAMPLES_BY_TYPE, DSL_FEEDBACK, DSL_SYSTEM, RECIPE_GROWTH
 from .schema_linking import render_schema
 
@@ -45,6 +46,7 @@ def _messages(
     feedback: tuple[QueryArgs | None, str] | None,
     *,
     original_dsl: dict[str, Any] | None = None,
+    pattern_hints: str = "",
 ) -> list[ChatMessage]:
     type_key = "card" if chart_type is ChartType.KPI else chart_type.value
     example_dict = DSL_EXAMPLES_BY_TYPE.get(type_key, DSL_EXAMPLES_BY_TYPE["bar"])
@@ -57,6 +59,8 @@ def _messages(
         example_json=json.dumps(example_dict, ensure_ascii=False),
         recipe_growth=json.dumps(RECIPE_GROWTH, ensure_ascii=False),
     )
+    if pattern_hints:
+        prompt += pattern_hints
     user_content = f"Заголовок графика: «{title}».\nВопрос: {question}\nНазначение: {purpose or title}"
     if original_dsl is not None:
         user_content += (
@@ -99,13 +103,18 @@ async def build_dsl(
     feedback: tuple[QueryArgs | None, str] | None = None
     total_tries = max_attempts_per_step + 1
     seen_hashes = set()
+    pattern_hints = build_pattern_hints(detect_patterns(question, catalog, tables))
 
     for attempt in range(total_tries):
         if attempt > 0 and not budget.consume(f"dsl:{title}"):
             warnings.append(f"{title}: бюджет исчерпан")
             return None, warnings
 
-        messages = _messages(question, chart_type, title, purpose, catalog, tables, feedback, original_dsl=original_dsl)
+        messages = _messages(
+            question, chart_type, title, purpose, catalog, tables, feedback,
+            original_dsl=original_dsl,
+            pattern_hints=pattern_hints,
+        )
         prompt_text = "\n".join(m.content for m in messages)
 
         try:

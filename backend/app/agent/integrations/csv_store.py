@@ -18,7 +18,7 @@ from ..contracts.catalog import Catalog, ColumnInfo, Relation, SemanticType, Tab
 _INT_RE = re.compile(r"^-?\d+$")
 _FLOAT_RE = re.compile(r"^-?\d{1,3}(?:[  ]\d{3})*(?:[.,]\d+)?$|^-?\d+(?:[.,]\d+)?$")
 _BOOL_VALUES = {"true": True, "false": False, "да": True, "нет": False}
-_ID_NAME_RE = re.compile(r"(^|\W)(код|id|идентификатор|номер|артикул)(\W|$)", re.I)
+_ID_NAME_RE = re.compile(r"(^|[^\w]|_)(код|id|идентификатор|номер|артикул)([^\w]|_|$)", re.I)
 _NULLS = {"", "null", "none", "nan", "n/a", "-"}
 _SAMPLE = 2000
 

@@ -31,7 +31,7 @@ _PG_TO_DSL = {
     "timestamp with time zone": "datetime",
     "timestamptz": "datetime",
 }
-_ID_NAME_RE = re.compile(r"(^|\W|_)(код|id|идентификатор|номер|артикул)(\W|_|$)", re.I)
+_ID_NAME_RE = re.compile(r"(^|[^\w]|_)(код|id|идентификатор|номер|артикул)([^\w]|_|$)", re.I)
 _TOP_VALUES = 10
 
 

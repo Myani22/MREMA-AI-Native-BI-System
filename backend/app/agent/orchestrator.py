@@ -936,20 +936,36 @@ class Agent:
         self, run: _Run, question: str, skipped: list[tuple[str, str]]
     ) -> tuple[str, list[str]]:
         log.warning("Не удалось построить графики: %s", skipped)
-        # Очищаем технические подробности для пользователя
+
+        if skipped and all(("нет данных" in r.lower() or "empty" in r.lower()) for _, r in skipped):
+            periods: list[str] = []
+            for t in run.catalog.tables:
+                if t.period_start and t.period_end:
+                    periods.append(f"«{t.label}»: {t.period_start} — {t.period_end}")
+                elif t.row_count == 0:
+                    periods.append(f"«{t.label}»: пустая таблица")
+            period_text = "; ".join(periods) if periods else "период не определён"
+            return (
+                f"В данных нет записей за запрошенный период. Доступные периоды: {period_text}. "
+                f"Уточните диапазон дат или сформулируйте вопрос по доступным данным.",
+                self._examples(run.catalog)[:3],
+            )
+
         clean_errors = []
-        for title, err in skipped:
+        for _title, err in skipped:
             if "модель повторила" in err:
                 clean_errors.append("не удалось подобрать правильный запрос к данным")
             elif "тип не подходит" in err:
                 clean_errors.append("в данных неверный тип поля (например, текст вместо чисел)")
+            elif "нет колонки" in err or "нет такой колонки" in err:
+                clean_errors.append("в данных нет нужной колонки")
             else:
                 clean_errors.append("внутренняя ошибка построения")
-                
         reason = clean_errors[0] if clean_errors else "неизвестная ошибка"
         return (
-            f"К сожалению, не удалось построить график по этому запросу ({reason}). Попробуйте переформулировать вопрос или выбрать другие поля.", 
-            self._examples(run.catalog)[:3]
+            f"К сожалению, не удалось построить график по этому запросу ({reason}). "
+            f"Попробуйте переформулировать вопрос или выбрать другие поля.",
+            self._examples(run.catalog)[:3],
         )
 
     # async def _explain_failure(

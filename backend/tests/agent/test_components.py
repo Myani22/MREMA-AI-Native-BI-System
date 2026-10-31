@@ -7,6 +7,8 @@ from app.agent.narrator import ungrounded_numbers
 from app.agent.router import detect_chart_type, route_by_rules
 from app.agent.viz import alternative_chart, choose_chart
 from tests.agent.fakes import CITY_TABLE, SqlArgs, make_catalog
+from app.agent.pattern_hints import detect_patterns
+from app.agent.contracts.catalog import Catalog, ColumnInfo, SemanticType, TableInfo
 
 
 def _table(*cols: tuple[str, SemanticType], rows: list[list]) -> ResultTable:
@@ -117,3 +119,46 @@ def test_allowed_chart_types_restrict_choice_with_note():
     spec, note = choose_chart(CITY_TABLE, requested=ChartType.PIE, allowed=allowed)
     assert spec.chart_type is ChartType.BAR and "пока не поддерживается" in note
     assert alternative_chart(CITY_TABLE, ChartType.BAR, allowed=allowed).chart_type is ChartType.LINE
+
+def _catalog_with_id() -> Catalog:
+    return Catalog(tables=[TableInfo(
+        name="sales", row_count=100,
+        columns=[
+            ColumnInfo(name="ID_Аптеки", db_type="int", semantic_type=SemanticType.ID),
+            ColumnInfo(name="ID_Лекарства", db_type="int", semantic_type=SemanticType.ID),
+            ColumnInfo(name="Дата", db_type="date", semantic_type=SemanticType.DATE),
+            ColumnInfo(name="Сколько_Купили", db_type="int", semantic_type=SemanticType.NUMERIC),
+        ],
+    )])
+
+
+def test_id_name_regex_matches_russian_id_columns():
+    from app.agent.integrations.csv_store import _ID_NAME_RE
+    assert _ID_NAME_RE.search("ID_Аптеки")
+    assert _ID_NAME_RE.search("ID_Лекарства")
+    assert _ID_NAME_RE.search("user_id")
+    assert _ID_NAME_RE.search("Код заказа")
+    # не должно быть false-positive
+    assert not _ID_NAME_RE.search("paid")
+    assert not _ID_NAME_RE.search("valid")
+
+
+def test_detect_patterns_q1_q6():
+    cat = _catalog_with_id()
+    tables = ["sales"]
+    assert "period_growth" in detect_patterns(
+        "Какое лекарство сильнее всего выросло в процентах по среднедневным продажам "
+        "на аптеку в марте 2025 к февралю, включая дни без продаж?", cat, tables)
+    assert "per_day" in detect_patterns(
+        "... включая дни без продаж?", cat, tables)
+    assert "net_revenue" in detect_patterns(
+        "В каком городе сильнее всего выросла чистая выручка в процентах в марте 2025 "
+        "к февралю с учётом количества, скидок и возвратов?", cat, tables)
+    assert "percentile_having" in detect_patterns(
+        "У какой группы максимальный 90-й перцентиль времени решения? "
+        "Исключи группы с менее чем 100 закрытиями.", cat, tables)
+    assert "as_of_date" in detect_patterns(
+        "Сколько было согласовано, но ещё не оплачено на конец 31 марта 2025?", cat, tables)
+    assert "aggregate_of_aggregate" in detect_patterns(
+        "Для каждого задания рассчитай долю цепочек, завершившихся успешно только "
+        "после повторных попыток, и среднее число попыток в таких цепочках.", cat, tables)
