@@ -5,6 +5,7 @@ import re
 from .contracts.catalog import TIME_TYPES, Catalog, ColumnInfo, SemanticType, TableInfo
 
 _WORD_RE = re.compile(r"\w+", re.U)
+_DERIVED_BASE_RE = re.compile(r"«([^»]+)»")
 
 
 def _stems(text: str | None) -> set[str]:
@@ -38,7 +39,7 @@ def select_tables(question: str, catalog: Catalog, *, focus: list[str] | None = 
     return picked
 
 
-def _column_line(c: ColumnInfo) -> str:
+def _column_line(c: ColumnInfo, derived: list[str] | None = None) -> str:
     parts = [c.semantic_type.value]
     if c.unit:
         parts.append(c.unit)
@@ -54,6 +55,9 @@ def _column_line(c: ColumnInfo) -> str:
         line += f" — в файле «{c.display_name}»"
     if c.description:
         line += f" — {c.description}"
+    if derived:
+        derived_str = ", ".join(f"«{d}»" for d in derived)
+        line += f"; производные: {derived_str}"
     return line
 
 
@@ -71,10 +75,22 @@ def render_schema(catalog: Catalog, tables: list[str], *, max_columns: int = 60)
         if t.period_start and t.period_end:
             header += f", период {t.period_start} — {t.period_end}"
         lines.append(header + (f". {t.description}" if t.description else ""))
-        shown = t.columns[: max(budget, 0)]
-        lines.extend(_column_line(c) for c in shown)
-        if len(shown) < len(t.columns):
-            lines.append(f"  ... ещё {len(t.columns) - len(shown)} колонок")
+        col_names = {c.name for c in t.columns}
+        derived_map: dict[str, list[str]] = {}
+        skipped_derived: set[str] = set()
+        for c in t.columns:
+            if isinstance(c.description, str) and c.description.startswith("производная от «"):
+                m = _DERIVED_BASE_RE.search(c.description)
+                if m:
+                    base_name = m.group(1)
+                    if base_name in col_names and c.name.startswith(base_name + " ("):
+                        derived_map.setdefault(base_name, []).append(c.name)
+                        skipped_derived.add(c.name)
+        visible_columns = [c for c in t.columns if c.name not in skipped_derived]
+        shown = visible_columns[: max(budget, 0)]
+        lines.extend(_column_line(c, derived_map.get(c.name)) for c in shown)
+        if len(shown) < len(visible_columns):
+            lines.append(f"  ... ещё {len(visible_columns) - len(shown)} колонок")
         budget -= len(shown)
     rels = [r for r in catalog.relations if r.left_table in tables and r.right_table in tables]
     if rels:

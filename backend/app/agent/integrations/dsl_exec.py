@@ -11,6 +11,7 @@ from app.query_system import QueryEngine
 
 from ..contracts.catalog import Catalog
 from ..contracts.tools import ToolContext, ToolStatus
+from ..dsl_normalize import normalize_dsl
 from .dsl_to_sql import DslCompileError, compile_dsl_to_sql
 from .query_dsl import QueryArgs, SourceArg, format_errors
 
@@ -72,6 +73,10 @@ class DslRunner:
         return {**catalog_schema(catalog), **self._schema()}
 
     async def run(self, args: QueryArgs, ctx: ToolContext, *, max_rows: int) -> DslOutcome:
+        try:
+            args = QueryArgs.model_validate(normalize_dsl(args.to_engine(), ctx.catalog, ctx.question))
+        except Exception:
+            pass
         memory = self._schema()
         schema = {**catalog_schema(ctx.catalog), **memory}
         query = self.engine.from_dict(args.to_engine())

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from app.query_system import QueryEngine
@@ -8,6 +9,7 @@ from app.query_system import QueryEngine
 from .catalog_refs import fix_query_args_columns
 from .contracts.catalog import Catalog
 from .contracts.response import ChartType
+from .dsl_normalize import normalize_dsl
 from .error_budget import ErrorBudget
 from .integrations.dsl_exec import catalog_schema
 from .integrations.query_dsl import QueryArgs, format_errors
@@ -15,9 +17,10 @@ from .llm.client import ChatMessage, LLMClient, system_msg, user_msg
 from .llm.errors import StructuredOutputError
 from .llm.structured import generate_structured
 from .pipeline_validator import validate_chart_pipeline
-from .prompts import DSL_EXAMPLES_BY_TYPE, DSL_FEEDBACK, DSL_SYSTEM, RECIPE_GROWTH
+from .prompts import DSL_EXAMPLES_BY_TYPE, DSL_FEEDBACK, DSL_SYSTEM, RECIPE_GROWTH, RECIPE_TWO_LEVELS
 from .schema_linking import render_schema
 
+log = logging.getLogger(__name__)
 _engine = QueryEngine()
 
 
@@ -33,6 +36,16 @@ def _validate_against_engine(args: QueryArgs, catalog: Catalog, tables: list[str
     if validation.ok:
         return []
     return [format_errors(validation.errors)]
+
+
+def _preprocess_dsl(data: Any, catalog: Catalog, question: str) -> Any:
+    fixed = fix_query_args_columns(data, catalog)
+    try:
+        normalized = normalize_dsl(fixed, catalog, question)
+        QueryArgs.model_validate(normalized)
+        return normalized
+    except Exception:
+        return fixed
 
 
 def _messages(
@@ -56,6 +69,7 @@ def _messages(
         schema=schema_text,
         example_json=json.dumps(example_dict, ensure_ascii=False),
         recipe_growth=json.dumps(RECIPE_GROWTH, ensure_ascii=False),
+        recipe_two_levels=json.dumps(RECIPE_TWO_LEVELS, ensure_ascii=False),
     )
     user_content = f"Заголовок графика: «{title}».\nВопрос: {question}\nНазначение: {purpose or title}"
     if original_dsl is not None:
@@ -92,9 +106,8 @@ async def build_dsl(
     tables: list[str],
     budget: ErrorBudget,
     max_attempts_per_step: int = 2,
-    original_dsl: dict[str, Any] | None = None, 
+    original_dsl: dict[str, Any] | None = None,
 ) -> tuple[QueryArgs | None, list[str]]:
-    """LLM #3 + repair-loop. Возвращает (QueryArgs | None, warnings)."""
     warnings: list[str] = []
     feedback: tuple[QueryArgs | None, str] | None = None
     total_tries = max_attempts_per_step + 1
@@ -115,13 +128,13 @@ async def build_dsl(
                 QueryArgs,
                 schema_name="dsl_query",
                 max_attempts=1,
-                preprocess=lambda d: fix_query_args_columns(d, catalog),
+                preprocess=lambda d: _preprocess_dsl(d, catalog, question),
                 validate=lambda a: validate_chart_pipeline(a, chart_type=chart_type.value),
             )
             completion_text = args.model_dump_json()
         except StructuredOutputError as e:
             completion_text = e.raw
-            
+
             h = hash((prompt_text, completion_text))
             if h in seen_hashes:
                 warnings.append(f"{title}: модель повторила тот же ответ")
@@ -132,6 +145,12 @@ async def build_dsl(
             warnings.append(f"{title}: невалидный DSL ({err_msg})")
             feedback = (None, err_msg)
             continue
+
+        try:
+            normalized = normalize_dsl(args.to_engine(), catalog, question)
+            args = QueryArgs.model_validate(normalized)
+        except Exception:
+            log.debug("normalize_dsl failed on attempt %d, using original", attempt)
 
         h = hash((prompt_text, completion_text))
         if h in seen_hashes:
