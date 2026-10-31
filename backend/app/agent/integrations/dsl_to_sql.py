@@ -51,10 +51,6 @@ def _q(name: str) -> str:
 
 def _col(name: str, alias: str = "") -> str:
     prefix = f"{alias}." if alias else ""
-    if name.endswith(" (месяц)"):
-        return f"date_trunc('month', {prefix}{_q(name[:-8])})::date"
-    if name.endswith(" (год)"):
-        return f"EXTRACT(YEAR FROM {prefix}{_q(name[:-6])})::int"
     return f"{prefix}{_q(name)}"
 
 
@@ -209,7 +205,23 @@ def compile_dsl_to_sql(
             if step.table not in columns:
                 raise DslCompileError(f"нет таблицы {step.table}")
             phys = table_map.get(step.table, step.table)
-            body = f"SELECT * FROM {_q(schema)}.{_q(phys)}"
+            
+            select_cols = []
+            for c in columns[step.table]:
+                if c.endswith(" (месяц)") and c[:-8] in columns[step.table]:
+                    base_col = c[:-8]
+                    select_cols.append(f"date_trunc('month', {_q(base_col)})::date AS {_q(c)}")
+                elif c.endswith(" (год)") and c[:-6] in columns[step.table]:
+                    base_col = c[:-6]
+                    select_cols.append(f"EXTRACT(YEAR FROM {_q(base_col)})::int AS {_q(c)}")
+                else:
+                    select_cols.append(_q(c))
+                    
+            if select_cols:
+                body = f"SELECT {', '.join(select_cols)} FROM {_q(schema)}.{_q(phys)}"
+            else:
+                body = f"SELECT * FROM {_q(schema)}.{_q(phys)}"
+                
             out = _Rel(list(columns[step.table]), [])
         elif isinstance(step, SelectArg):
             src = rel(step.input)
