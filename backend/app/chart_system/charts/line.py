@@ -163,4 +163,6 @@ class LineChart(ChartBase):
         ax.set_title(self.title)
         ax.set_xlabel(self.x.name)
         ax.set_ylabel(self.y.name)
+
+        fig.autofmt_xdate()
         return figure_to_png_bytes(fig)

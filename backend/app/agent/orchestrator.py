@@ -76,6 +76,8 @@ from .integrations.dsl_edit import (
     apply_limit_to_dsl, apply_sort_to_dsl,
     detect_limit_request, detect_sort_request, resolve_column_name,
 )
+from .downsample import downsample_for_chart
+
 
 log = logging.getLogger(__name__)
 
@@ -1018,17 +1020,26 @@ class Agent:
         table = micro.table
         if not table.rows:
             return []
+        
         spec = micro.chart_spec
         blocks: list[Block] = []
         chart_block = None
+        
         if spec.chart_type is not ChartType.TABLE:
-            chart_block = self._chart_block(f"{micro.id}-chart", spec, table, micro.note)
-        if chart_block is not None:
-            blocks.append(chart_block)
+            chart_table, chart_spec, is_sampled = downsample_for_chart(table, spec)
+            chart_block = self._chart_block(f"{micro.id}-chart", chart_spec, chart_table, micro.note)
+            if chart_block is not None:
+                blocks.append(chart_block)
+                
+        table_spec = ChartSpec(chart_type=ChartType.TABLE, title=spec.title)
+        grid_table, _, _ = downsample_for_chart(table, table_spec)
+
         if chart_block is None or chart_block.spec.chart_type is not ChartType.KPI or micro.calculation:
-            blocks.append(TableBlock(id=f"{micro.id}-table", title=spec.title, data=table))
+            blocks.append(TableBlock(id=f"{micro.id}-table", title=spec.title, data=grid_table))
+            
         if micro.calculation:
             blocks.append(TextBlock(markdown="**Как считали**", points=micro.calculation))
+            
         if micro.ranking is not None:
             blocks.append(TableBlock(id=f"{micro.id}-ranking", title="Все значения", data=micro.ranking))
         return blocks
